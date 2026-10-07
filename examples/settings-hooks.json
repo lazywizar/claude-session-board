@@ -1,0 +1,39 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "Notification": [
+      { "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "PostToolUseFailure": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "async": true, "command": "python3 ~/.claude-session-board/board.py hook" }] }
+    ]
+  }
+}

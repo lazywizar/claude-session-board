@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps the board running on macOS: starts at login, restarts if it stops.
+  Replace HOME_DIR with your home directory (for example /Users/you), then:
+    cp examples/launchd.plist ~/Library/LaunchAgents/claude-session-board.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/claude-session-board.plist
+  PATH must include the folder that holds the `claude` binary.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>claude-session-board</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>HOME_DIR/.claude-session-board/board.py</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>HOME_DIR/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/Library/Logs/claude-session-board.log</string>
+</dict>
+</plist>
