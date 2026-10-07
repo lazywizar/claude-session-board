@@ -46,6 +46,7 @@
     @keyframes pulse { 50% { box-shadow: 0 0 0 3px rgba(212, 44, 32, .35); } }
     @media (prefers-reduced-motion: reduce) { .row.waiting { animation: none; box-shadow: 0 0 0 2px var(--red); } }
 
+    .head:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
     .head { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; padding: 8px 12px; cursor: pointer; }
     .state { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--grey); }
     .waiting .state { color: var(--red); }
@@ -109,6 +110,7 @@
     let board = null;
     let historyOpen = false;
     let historyTimer;
+    let historyRequest = 0;
 
     function escapeHtml(value) {
       const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -195,7 +197,7 @@
       const showReason = (s.state === "waiting" || s.state === "asked") && s.reason;
       return `
         <div class="row ${s.state} ${expanded.has(s.sid) ? "open" : ""}" data-sid="${escapeHtml(s.sid)}">
-          <div class="head">
+          <div class="head" role="button" tabindex="0" aria-expanded="${expanded.has(s.sid)}">
             <span class="state">${LABELS[s.state]}</span>
             <span><span class="name">${escapeHtml(s.name)}</span> ${chips(s)}</span>
             <span class="mute small">${s.cpu}% cpu · ${s.mb} MB · ${timeAgo(s.last_active)}</span>
@@ -213,7 +215,7 @@
       details += section("Where", `<code>${escapeHtml(s.cwd)}</code> <span class="mute small">${escapeHtml(s.sid)}</span>`);
       return `
         <div class="row ${expanded.has(s.sid) ? "open" : ""}" data-sid="${escapeHtml(s.sid)}">
-          <div class="head">
+          <div class="head" role="button" tabindex="0" aria-expanded="${expanded.has(s.sid)}">
             <span class="mute small">${timeAgo(s.last_active)} ago</span>
             <span>${chips(s)}</span><span></span>
             <span></span><span class="topic">${escapeHtml(s.title || s.first_prompt)}</span>
@@ -241,7 +243,10 @@
         const rows = live.filter((s) => s.state === state);
         if (rows.length) html += `<h2>${title} (${rows.length})</h2>` + rows.map(liveRow).join("");
       }
+      // Rebuilding the list would drop keyboard focus; put it back on the same row.
+      const focusedSid = document.activeElement?.closest?.("#live .row")?.dataset.sid;
       $("live").innerHTML = html || '<div class="empty">No live sessions match.</div>';
+      if (focusedSid) document.querySelector(`#live .row[data-sid="${CSS.escape(focusedSid)}"] .head`)?.focus();
     }
 
     async function loadLive() {
@@ -254,14 +259,16 @@
     }
 
     async function loadHistory() {
+      const request = ++historyRequest;
       const query = $("filter").value.trim();
       let result;
       try {
         result = await (await fetch("/api/history?q=" + encodeURIComponent(query))).json();
       } catch {
-        $("history-info").textContent = "board server not responding";
+        if (request === historyRequest) $("history-info").textContent = "board server not responding";
         return;
       }
+      if (request !== historyRequest || !historyOpen) return;
       const n = result.rows.length;
       $("history-info").textContent = query
         ? `${n} match${n === 1 ? "" : "es"}${n === 100 ? " (first 100)" : ""}`
@@ -275,6 +282,7 @@
       if (historyOpen) {
         loadHistory();
       } else {
+        historyRequest++;
         $("history").innerHTML = "";
         $("history-info").textContent = "";
       }
@@ -301,18 +309,34 @@
         return;
       }
       if (focusButton) {
-        const response = await fetch("/api/focus?sid=" + encodeURIComponent(focusButton.dataset.focus), { method: "POST" });
-        const message = await response.text();
-        if (message !== "ok") toast(message);
+        try {
+          const response = await fetch("/api/focus?sid=" + encodeURIComponent(focusButton.dataset.focus), { method: "POST" });
+          const message = await response.text();
+          if (message !== "ok") toast(message);
+        } catch {
+          toast("board server not responding");
+        }
         return;
       }
       if (event.target.closest(".details")) return;
       const row = event.target.closest(".row");
-      if (!row) return;
+      if (row) toggleRow(row);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      const head = event.target.closest(".head");
+      if (head && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        toggleRow(head.parentElement);
+      }
+    });
+
+    function toggleRow(row) {
       const sid = row.dataset.sid;
       expanded.has(sid) ? expanded.delete(sid) : expanded.add(sid);
       row.classList.toggle("open");
-    });
+      row.querySelector(".head").setAttribute("aria-expanded", expanded.has(sid));
+    }
 
     loadLive();
     setInterval(() => {
