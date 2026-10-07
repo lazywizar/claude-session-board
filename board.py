@@ -38,6 +38,8 @@ FLOW_DB = os.path.join(HOME, ".flow/flow.db")
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 NOTIFY_DELAY = 4  # seconds a session must stay blocked before we show a desktop banner
+HEAD_BYTES = 256 * 1024  # enough to find the first prompt
+TAIL_BYTES = 512 * 1024  # enough to find the latest title, prompt and reply
 STATE_ORDER = {"waiting": 0, "asked": 1, "busy": 2, "idle": 3}
 PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.html")
 
@@ -100,13 +102,18 @@ def repo_of(cwd):
     return os.path.basename(cwd or "") or "?"
 
 
-def session_name(session_id):
-    """The name Claude Code shows for a session (set with /rename), else a short id."""
+def session_files():
+    """Claude Code's per-process registry: one JSON file per running session."""
     for path in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
         try:
-            info = read_json(path)
+            yield read_json(path)
         except (OSError, ValueError):
             continue
+
+
+def session_name(session_id):
+    """The name Claude Code shows for a session (set with /rename), else a short id."""
+    for info in session_files():
         if info.get("sessionId") == session_id:
             return info.get("name") or session_id[:8]
     return session_id[:8]
@@ -196,7 +203,7 @@ def run_hook():
     # user if this one is still open after a few seconds.
     time.sleep(NOTIFY_DELAY)
     row = conn.execute("select since from waiting where id = ?", (event["session_id"],)).fetchone()
-    if row and row[0] == now:
+    if row and row[0] == now:  # still the same wait this hook started, not a newer one
         notify(f"Claude needs you: {session_name(event['session_id'])}", reason)
 
 
@@ -232,8 +239,8 @@ def _user_prompt(record):
 def read_transcript(path):
     """Title, first and last prompt, PR link and Claude's last reply from a transcript.
 
-    Transcripts can be hundreds of MB, so only the first 256 KB and last 512 KB are
-    read, and results are cached until the file changes.
+    Transcripts can be hundreds of MB, so only the head and tail are read, and
+    results are cached until the file changes.
     """
     try:
         mtime = os.path.getmtime(path)
@@ -245,9 +252,9 @@ def read_transcript(path):
 
     info = {"title": "", "first_prompt": "", "last_prompt": "", "pr": "", "last_text": "", "cwd": "", "mtime": mtime}
     with open(path, "rb") as f:
-        head = f.read(256 * 1024).decode("utf-8", "ignore")
+        head = f.read(HEAD_BYTES).decode("utf-8", "ignore")
         size = f.seek(0, os.SEEK_END)
-        f.seek(max(0, size - 512 * 1024))
+        f.seek(max(0, size - TAIL_BYTES))
         tail = f.read().decode("utf-8", "ignore")
 
     for record in _json_lines(head):
@@ -272,6 +279,8 @@ def read_transcript(path):
             text = " ".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
             if text.strip():
                 info["last_text"] = text.strip()[-400:]
+        # Records are in order, so whichever comes last wins: Claude's own "last-prompt"
+        # record, or a user message we can read directly.
         info["last_prompt"] = _user_prompt(record) or info["last_prompt"]
 
     _transcript_cache[path] = (mtime, info)
@@ -319,6 +328,20 @@ def descendants(pid, children):
     return found
 
 
+def process_stats(pid, procs, children):
+    """CPU and memory for a session's whole process tree, plus its busiest children."""
+    if pid not in procs:
+        return {"tty": "", "cpu": 0, "mb": 0, "procs": []}
+    tree = [procs[p] for p in [pid, *descendants(pid, children)] if p in procs]
+    busiest = sorted(tree[1:], key=lambda p: -p["cpu"])[:10]
+    return {
+        "tty": procs[pid]["tty"],
+        "cpu": round(sum(p["cpu"] for p in tree), 1),
+        "mb": sum(p["mb"] for p in tree),
+        "procs": [{"pid": p["pid"], "cpu": p["cpu"], "cmd": short(p["cmd"], 110)} for p in busiest],
+    }
+
+
 def flow_tasks():
     """{session_id: task} from flow's database, or {} if flow isn't installed."""
     if not os.path.exists(FLOW_DB):
@@ -339,11 +362,10 @@ def live_sessions():
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     sessions = []
-    for path in glob.glob(os.path.join(CLAUDE_DIR, "sessions", "*.json")):
+    for info in session_files():
         try:
-            info = read_json(path)
             os.kill(info["pid"], 0)  # raises if the process is gone
-        except (OSError, ValueError, KeyError):
+        except (OSError, KeyError, TypeError):
             continue
         sessions.append(info)
     return sessions
@@ -362,10 +384,7 @@ def subagents_of(session_id, transcript, conn, now):
     """Subagents a session spawned, newest first, running ones on top."""
     if not transcript:
         return []
-    started = {
-        agent: ended
-        for agent, ended in conn.execute("select agent, ended from subagents where id = ?", (session_id,))
-    }
+    ended_at = dict(conn.execute("select agent, ended from subagents where id = ?", (session_id,)))
     found = []
     for meta_path in glob.glob(os.path.join(transcript[: -len(".jsonl")], "subagents", "*.meta.json")):
         agent_id = os.path.basename(meta_path)[len("agent-") : -len(".meta.json")]
@@ -374,8 +393,11 @@ def subagents_of(session_id, transcript, conn, now):
             last = os.path.getmtime(meta_path[: -len(".meta.json")] + ".jsonl")
         except (OSError, ValueError):
             continue
-        # Hook data is exact; for subagents from before the hook existed, guess from recent writes.
-        running = started[agent_id] is None if agent_id in started else now - last < 30
+        if agent_id in ended_at:
+            running = ended_at[agent_id] is None
+        else:
+            # Started before the hook was installed: guess from recent writes.
+            running = now - last < 30
         found.append(
             {"desc": short(meta.get("description"), 120), "type": meta.get("agentType", ""), "running": running, "last": last}
         )
@@ -393,9 +415,8 @@ def resume_command(session_id, cwd, task=None, background_id=None):
 
 # ---------------------------------------------------------------- the board snapshot
 
-_snapshot_lock = threading.Lock()
-_snapshot = {"at": 0.0, "data": None}
-_history_synced_at = [0.0]
+_cache_lock = threading.Lock()
+_cache = {"at": 0.0, "data": None, "history_synced_at": 0.0}
 
 
 def sync_history(conn):
@@ -425,6 +446,7 @@ def session_state(session_id, status, transcript_info, waiting):
         return "waiting", waiting[session_id]
     if status == "blocked":  # a background job waiting on the user
         return "waiting", ""
+    # Interactive sessions report busy/idle/shell; background jobs report working/running.
     if status in ("busy", "shell", "working", "running"):
         return "busy", ""
     last_text = transcript_info.get("last_text", "").rstrip()
@@ -438,9 +460,9 @@ def session_state(session_id, status, transcript_info, waiting):
 
 def build_snapshot():
     now, conn = time.time(), connect()
-    if now - _history_synced_at[0] > 30:
+    if now - _cache["history_synced_at"] > 30:
         sync_history(conn)
-        _history_synced_at[0] = now
+        _cache["history_synced_at"] = now
 
     procs, children = process_table()
     tasks = flow_tasks()
@@ -458,9 +480,6 @@ def build_snapshot():
         if background and not reason:
             reason = background_need(agent.get("id"))
 
-        pid = agent.get("pid")
-        tree = [pid] + descendants(pid, children) if pid in procs else []
-        kids = sorted((procs[p] for p in tree[1:] if p in procs), key=lambda p: -p["cpu"])
         files = conn.execute("select path from files where id = ? order by ts desc limit 15", (session_id,))
         live.append(
             {
@@ -471,11 +490,8 @@ def build_snapshot():
                 "kind": "background" if background else "interactive",
                 "state": state,
                 "reason": reason,
-                "pid": pid,
-                "tty": procs[pid]["tty"] if pid in procs else "",
-                "cpu": round(sum(procs[p]["cpu"] for p in tree if p in procs), 1),
-                "mb": sum(procs[p]["mb"] for p in tree if p in procs),
-                "procs": [{"pid": p["pid"], "cpu": p["cpu"], "cmd": short(p["cmd"], 110)} for p in kids[:10]],
+                "pid": agent.get("pid"),
+                **process_stats(agent.get("pid"), procs, children),
                 "title": t.get("title", ""),
                 "first_prompt": t.get("first_prompt", ""),
                 "last_prompt": t.get("last_prompt", ""),
@@ -493,26 +509,25 @@ def build_snapshot():
 
 def snapshot():
     """The current board, rebuilt at most every 2 seconds however many tabs poll it."""
-    with _snapshot_lock:
-        if time.time() - _snapshot["at"] >= 2:
-            _snapshot["data"] = build_snapshot()
-            _snapshot["at"] = time.time()
-        return _snapshot["data"]
+    with _cache_lock:
+        if time.time() - _cache["at"] >= 2:
+            _cache["data"] = build_snapshot()
+            _cache["at"] = time.time()
+        return _cache["data"]
 
 
 def search_history(query, limit=100):
     """Past sessions, newest first, filtered in SQL so the page never loads the whole archive."""
     conn, tasks, query = connect(), flow_tasks(), query.strip()
     live_ids = [s["sid"] for s in snapshot()["live"]]
-    task_hits = [sid for sid, task in tasks.items() if query and query.lower() in f"{task['slug']} {task['name']}".lower()]
-    like = f"%{query}%"
-    sql = f"""
-        select * from history
-        where id not in ({placeholders(len(live_ids))})
-          and (? = '' or title like ? or first_prompt like ? or last_prompt like ? or cwd like ? or id like ?
-               or id in ({placeholders(len(task_hits))}))
-        order by mtime desc limit ?"""
-    rows = conn.execute(sql, (*live_ids, query, like, like, like, like, like, *task_hits, limit))
+    where, params = f"id not in ({placeholders(len(live_ids))})", list(live_ids)
+    if query:
+        columns = ("title", "first_prompt", "last_prompt", "cwd", "id")
+        task_hits = [sid for sid, task in tasks.items() if query.lower() in f"{task['slug']} {task['name']}".lower()]
+        matches = [f"{column} like ?" for column in columns] + [f"id in ({placeholders(len(task_hits))})"]
+        where += f" and ({' or '.join(matches)})"
+        params += [f"%{query}%"] * len(columns) + task_hits
+    rows = conn.execute(f"select * from history where {where} order by mtime desc limit ?", (*params, limit))
     results = [
         {
             "sid": sid,
@@ -600,7 +615,7 @@ return "tab not found in Terminal" """,
 }
 
 # Editors whose integrated terminal can't be targeted from outside: we open the folder's window.
-_EDITORS = {"Cursor.app": "Cursor", "Visual Studio Code.app": "Visual Studio Code", "Windsurf.app": "Windsurf"}
+_EDITORS = ("Cursor", "Visual Studio Code", "Windsurf")
 
 
 def focus(session_id):
@@ -618,8 +633,8 @@ def focus(session_id):
             return _select_tab("iTerm2", session["tty"])
         if "Terminal.app" in cmd:
             return _select_tab("Terminal", session["tty"])
-        for bundle, app in _EDITORS.items():
-            if bundle in cmd:
+        for app in _EDITORS:
+            if f"{app}.app" in cmd:
                 subprocess.run(["open", "-a", app, session["cwd"]], timeout=10)
                 return f"Opened its {app} window. Pick the terminal tab there."
         pid = procs[pid]["ppid"]
@@ -658,26 +673,25 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
-        if not self._trusted():
-            return self._send(403, "forbidden")
-        url = urlparse(self.path)
-        if url.path == "/":
-            with open(PAGE_PATH, encoding="utf-8") as f:
-                self._send(200, f.read(), "text/html; charset=utf-8")
-        elif url.path == "/api/sessions":
-            self._send(200, json.dumps(snapshot()), "application/json")
-        elif url.path == "/api/history":
-            query = parse_qs(url.query).get("q", [""])[0]
-            self._send(200, json.dumps(search_history(query)), "application/json")
-        else:
-            self._send(404, "not found")
+        self._route("GET")
 
     def do_POST(self):
+        self._route("POST")
+
+    def _route(self, method):
         if not self._trusted():
             return self._send(403, "forbidden")
         url = urlparse(self.path)
-        if url.path == "/api/focus":
-            self._send(200, focus(parse_qs(url.query).get("sid", [""])[0]))
+        query = parse_qs(url.query)
+        if method == "GET" and url.path == "/":
+            with open(PAGE_PATH, encoding="utf-8") as f:
+                self._send(200, f.read(), "text/html; charset=utf-8")
+        elif method == "GET" and url.path == "/api/sessions":
+            self._send(200, json.dumps(snapshot()), "application/json")
+        elif method == "GET" and url.path == "/api/history":
+            self._send(200, json.dumps(search_history(query.get("q", [""])[0])), "application/json")
+        elif method == "POST" and url.path == "/api/focus":
+            self._send(200, focus(query.get("sid", [""])[0]))
         else:
             self._send(404, "not found")
 
@@ -687,10 +701,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve():
     conn = connect()
-    two_weeks_ago = time.time() - 14 * 86400
-    conn.execute("delete from files where ts < ?", (two_weeks_ago,))
-    conn.execute("delete from subagents where started < ?", (two_weeks_ago,))
-    conn.execute("delete from waiting where since < ?", (time.time() - 3 * 86400,))
+    now = time.time()
+    # Edits and subagents only matter while a session is fresh. A "blocked" flag older
+    # than a few days is almost certainly from a session that died mid-prompt.
+    conn.execute("delete from files where ts < ?", (now - 14 * 86400,))
+    conn.execute("delete from subagents where started < ?", (now - 14 * 86400,))
+    conn.execute("delete from waiting where since < ?", (now - 3 * 86400,))
     conn.commit()
     print(f"claude-session-board on http://127.0.0.1:{PORT}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

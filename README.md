@@ -7,16 +7,11 @@ back to them.
 Built for the "twenty terminal tabs, one of them has been asking me a question for an hour"
 problem.
 
-- **Blocked on you** rows blink red the moment a session opens a permission prompt, a question or
-  a plan for review, and you get a desktop notification if it's still waiting 4 seconds later.
-- **Asked you**, **working** and **done** groups show the rest at a glance.
-- Click a row for its first prompt, your last request, running subagents, child processes with
-  CPU, files it edited, and its PR.
-- **Jump to terminal** brings the session's tab forward (iTerm2, Terminal) or its editor window
-  (VS Code, Cursor, Windsurf).
-- **History** keeps every past session searchable, with a one-click resume command.
-- `board.py who` tells an agent which other sessions are working in the same repo, so parallel
-  agents don't edit the same files.
+- Sessions grouped by what needs you, with a desktop notification when one gets blocked.
+- Click a row for its prompts, subagents, child processes and CPU, edited files and PR.
+- **Jump to terminal** for iTerm2 and Terminal, or the editor window for VS Code, Cursor and Windsurf.
+- Searchable history of past sessions, each with its resume command.
+- `board.py who` tells an agent which other sessions are working in the same repo.
 
 No LLM calls, no tokens, no dependencies: one Python file that reads what Claude Code already
 writes to `~/.claude`, plus a small hook for the things those files can't tell it.
@@ -32,24 +27,11 @@ writes to `~/.claude`, plus a small hook for the things those files can't tell i
 Paste this into Claude Code:
 
 ```text
-Install claude-session-board from https://github.com/lazywizar/claude-session-board for me.
-
-1. Clone it to ~/.claude-session-board and check `python3 --version` is 3.9 or newer.
-2. Back up ~/.claude/settings.json, then merge every hook from
-   ~/.claude-session-board/examples/settings-hooks.json into it. Append to existing hook
-   arrays; never remove or change hooks I already have. Validate the JSON afterwards.
-3. On macOS: copy examples/launchd.plist to
-   ~/Library/LaunchAgents/claude-session-board.plist, replace HOME_DIR with my home
-   directory, make sure its PATH includes the folder that holds `claude` (run `which claude`),
-   then load it with `launchctl bootstrap gui/$(id -u) <plist>`.
-   On Linux: tell me how to run `python3 ~/.claude-session-board/board.py serve` at login.
-4. Check http://127.0.0.1:7777/api/sessions returns JSON and open http://127.0.0.1:7777.
-5. Ask me before doing either of these optional steps:
-   - Add a line to ~/.claude/CLAUDE.md telling agents to run
-     `python3 ~/.claude-session-board/board.py who` before editing files in a repo.
-   - Set "cleanupPeriodDays": 365 in ~/.claude/settings.json so old sessions stay resumable
-     (Claude Code deletes transcripts after 30 days by default).
-Show me what you changed when you're done.
+Install https://github.com/lazywizar/claude-session-board by following its README's
+"Set it up by hand" section: clone to ~/.claude-session-board, merge the hooks into my
+~/.claude/settings.json (back it up first, keep my existing hooks), and on macOS install the
+launchd job with my paths filled in. Then open http://127.0.0.1:7777 to check it works.
+Ask me before the optional steps in that section. Show me what you changed.
 ```
 
 ## Set it up by hand
@@ -66,6 +48,13 @@ use [`examples/launchd.plist`](examples/launchd.plist) (instructions inside the 
 Sessions that were already running pick up the hooks when you open `/hooks` in them once, or when
 you resume them. Everything except the "blocked" signal works without the hooks.
 
+Optional:
+
+- Add a line to `~/.claude/CLAUDE.md` asking agents to run `python3 ~/.claude-session-board/board.py who`
+  before editing files in a repo.
+- Set `"cleanupPeriodDays": 365` in `~/.claude/settings.json`. Claude Code deletes transcripts
+  after 30 days by default, and a session can't be resumed without its transcript.
+
 ## Using it
 
 | State | Meaning |
@@ -75,16 +64,9 @@ you resume them. Everything except the "blocked" signal works without the hooks.
 | **Working** (green) | Running tools or writing a reply. |
 | **Done** | Finished, waiting for your next instruction. |
 
-**Name your sessions** with `/rename <name>` inside Claude. The board shows that name, and Claude
-writes it into the terminal title. In VS Code and Cursor, add this to your user settings so the
-tab shows it too:
-
-```json
-"terminal.integrated.tabs.title": "${process}${separator}${sequence}"
-```
-
-A tab you renamed by hand in the editor keeps that name and the board can't see it. Rename it to an
-empty name to hand control back to Claude.
+**Name your sessions** with `/rename <name>`. The board shows that name. To see it on VS Code or
+Cursor terminal tabs too, set `"terminal.integrated.tabs.title": "${process}${separator}${sequence}"`
+and don't rename tabs by hand (a manual tab name hides the one Claude sets).
 
 **Close sessions freely.** Claude saves the conversation as it goes. Close the tab or press
 `Ctrl+D`, and the session moves to History with a resume command (`claude --resume <id>`).
