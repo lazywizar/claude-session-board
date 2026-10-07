@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude sessions</title>
+  <style>
+    :root {
+      --bg: #f6f6f3; --card: #fff; --fg: #1c1c1a; --mute: #6d6d67; --line: #e2e2dc; --chip: #eeeee9;
+      --red: #d42c20; --amber: #b86e00; --green: #1a7f37; --grey: #9b9b95; --link: #2457c5;
+      --task-bg: #e7efff; --task-fg: #1d4fb8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #151514; --card: #1f1f1d; --fg: #ececea; --mute: #9d9d97; --line: #34342f; --chip: #2a2a27;
+        --link: #8fb0ff; --task-bg: #22305a; --task-fg: #b8ccff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    a { color: var(--link); }
+    code, .cmd { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    header {
+      position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+      padding: 10px 16px; background: var(--bg); border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0 8px 0 0; font-size: 16px; }
+    .count { padding: 2px 9px; border-radius: 99px; background: var(--chip); font-size: 13px; }
+    .count.hot { background: var(--red); color: #fff; }
+    #filter {
+      flex: 1; min-width: 180px; padding: 6px 10px; font: inherit; color: var(--fg);
+      background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    }
+
+    main { max-width: 1200px; margin: 0 auto; padding: 8px 16px 40px; }
+    h2 { margin: 18px 0 6px; font-size: 12px; color: var(--mute); text-transform: uppercase; letter-spacing: .06em; }
+    .empty { padding: 8px 0; color: var(--mute); }
+    .mute { color: var(--mute); }
+    .small { font-size: 12px; }
+
+    .row { margin: 6px 0; background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--grey); border-radius: 8px; }
+    .row.waiting { border-left-color: var(--red); animation: pulse 1.2s ease-in-out infinite; }
+    .row.asked { border-left-color: var(--amber); }
+    .row.busy { border-left-color: var(--green); }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 3px rgba(212, 44, 32, .35); } }
+    @media (prefers-reduced-motion: reduce) { .row.waiting { animation: none; box-shadow: 0 0 0 2px var(--red); } }
+
+    .head:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
+    .head { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; padding: 8px 12px; cursor: pointer; }
+    .state { font-size: 12px; font-weight: 600; text-transform: uppercase; color: var(--grey); }
+    .waiting .state { color: var(--red); }
+    .asked .state { color: var(--amber); }
+    .busy .state { color: var(--green); }
+    .name { font-weight: 600; }
+    .chip { display: inline-block; margin-right: 4px; padding: 0 7px; border-radius: 99px; background: var(--chip); font-size: 12px; }
+    .chip.task { background: var(--task-bg); color: var(--task-fg); }
+    .topic { grid-column: 2 / 4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .reason { grid-column: 1 / 4; font-weight: 600; color: var(--red); }
+    .asked .reason { font-weight: 400; color: var(--amber); }
+
+    .details { display: none; padding: 8px 12px 10px; border-top: 1px solid var(--line); }
+    .open .details { display: block; }
+    .details h3 { margin: 10px 0 2px; font-size: 12px; font-weight: 600; color: var(--mute); }
+    .details ul { margin: 0; padding-left: 18px; }
+    .running { font-weight: 600; color: var(--green); }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+    .cmd { padding: 3px 6px; background: var(--chip); border-radius: 4px; word-break: break-all; }
+    button {
+      padding: 3px 10px; font: inherit; font-size: 12px; color: var(--fg); cursor: pointer;
+      background: var(--card); border: 1px solid var(--line); border-radius: 5px;
+    }
+    button:hover { border-color: var(--mute); }
+
+    #toast {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: none;
+      padding: 6px 14px; font-size: 13px; color: var(--bg); background: var(--fg); border-radius: 6px;
+    }
+    @media (max-width: 640px) {
+      .head { grid-template-columns: 1fr auto; }
+      .topic { grid-column: 1 / 3; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Claude sessions</h1>
+    <span id="counts"></span>
+    <input id="filter" placeholder="Filter by repo, title, prompt, task..." autocomplete="off">
+  </header>
+  <main>
+    <div id="live"><div class="empty">Loading...</div></div>
+    <h2><button id="history-toggle">Show history</button> <span id="history-info" class="mute"></span></h2>
+    <div id="history"></div>
+  </main>
+  <div id="toast"></div>
+
+  <script>
+    const POLL_MS = 4000;
+    const LABELS = { waiting: "blocked", asked: "asked you", busy: "working", idle: "done" };
+    const GROUPS = [
+      ["waiting", "Blocked on you: a permission prompt, question or plan is open in its terminal"],
+      ["asked", "Asked you: finished, and its last message ends with a question"],
+      ["busy", "Working"],
+      ["idle", "Done: finished, waiting for your next instruction"],
+    ];
+
+    const $ = (id) => document.getElementById(id);
+    const expanded = new Set();
+    let board = null;
+    let historyOpen = false;
+    let historyTimer;
+    let historyRequest = 0;
+
+    function escapeHtml(value) {
+      const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+      return String(value ?? "").replace(/[&<>"']/g, (c) => map[c]);
+    }
+
+    function timeAgo(seconds) {
+      const minutes = Math.max(0, (Date.now() / 1000 - seconds) / 60);
+      if (minutes < 1) return "now";
+      if (minutes < 60) return `${Math.round(minutes)}m`;
+      if (minutes < 1440) return `${Math.round(minutes / 60)}h`;
+      return `${Math.round(minutes / 1440)}d`;
+    }
+
+    function toast(message) {
+      const el = $("toast");
+      el.textContent = message;
+      el.style.display = "block";
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => (el.style.display = "none"), 2200);
+    }
+
+    function matchesFilter(session, query) {
+      if (!query) return true;
+      const q = query.toLowerCase();
+      const task = session.flow || {};
+      return [session.repo, session.name, session.title, session.first_prompt, session.last_prompt,
+              session.cwd, task.name, task.slug, session.sid]
+        .some((v) => v && String(v).toLowerCase().includes(q));
+    }
+
+    function chips(session) {
+      let html = `<span class="chip">${escapeHtml(session.repo)}</span>`;
+      if (session.flow) {
+        html += `<span class="chip task" title="flow task">${escapeHtml(session.flow.slug)}: ${escapeHtml(session.flow.name)}</span>`;
+      }
+      if (session.kind === "background") html += '<span class="chip">background</span>';
+      const running = (session.subagents || []).filter((a) => a.running).length;
+      if (running) html += `<span class="chip">${running} subagent${running > 1 ? "s" : ""}</span>`;
+      return html;
+    }
+
+    function actions(session, isLive) {
+      let html = '<div class="actions">';
+      if (isLive && session.kind === "interactive" && session.tty) {
+        html += `<button data-focus="${escapeHtml(session.sid)}">Jump to terminal</button>`;
+      }
+      const verb = isLive && session.kind === "background" ? "attach" : "resume";
+      html += `<button data-copy="${escapeHtml(session.resume)}">Copy ${verb} command</button>`;
+      html += `<span class="cmd">${escapeHtml(session.resume)}</span>`;
+      if (!isLive && !session.resumable) html += '<span class="mute small">transcript deleted, cannot resume</span>';
+      return html + "</div>";
+    }
+
+    function section(title, body) {
+      return `<h3>${title}</h3>${body}`;
+    }
+
+    function liveDetails(s) {
+      let html = section("Context", `<div>${escapeHtml(s.first_prompt || "-")}</div>`);
+      if (s.last_prompt && s.last_prompt !== s.first_prompt) {
+        html += section("Last thing you asked", `<div>${escapeHtml(s.last_prompt)}</div>`);
+      }
+      if (s.subagents.length) {
+        html += section("Subagents", "<ul>" + s.subagents.map((a) =>
+          `<li>${a.running ? '<span class="running">running</span> ' : ""}${escapeHtml(a.desc || "(no description)")}
+           <span class="mute small">${escapeHtml(a.type)} · ${timeAgo(a.last)}</span></li>`).join("") + "</ul>");
+      }
+      if (s.procs.length) {
+        html += section("Child processes", "<ul>" + s.procs.map((p) =>
+          `<li><code>${p.cpu.toFixed(1)}%</code> <code>${escapeHtml(p.cmd)}</code></li>`).join("") + "</ul>");
+      }
+      if (s.files.length) {
+        html += section("Recently edited", "<ul>" + s.files.map((f) => `<li><code>${escapeHtml(f)}</code></li>`).join("") + "</ul>");
+      }
+      if (s.pr) {
+        html += section("PR", `<a href="${escapeHtml(s.pr)}" target="_blank" rel="noopener">${escapeHtml(s.pr)}</a>`);
+      }
+      html += section("Where", `<code>${escapeHtml(s.cwd)}</code> <span class="mute small">pid ${escapeHtml(s.pid || "-")} · ${escapeHtml(s.sid)}</span>`);
+      return html + actions(s, true);
+    }
+
+    function liveRow(s) {
+      const showReason = (s.state === "waiting" || s.state === "asked") && s.reason;
+      return `
+        <div class="row ${s.state} ${expanded.has(s.sid) ? "open" : ""}" data-sid="${escapeHtml(s.sid)}">
+          <div class="head" role="button" tabindex="0" aria-expanded="${expanded.has(s.sid)}">
+            <span class="state">${LABELS[s.state]}</span>
+            <span><span class="name">${escapeHtml(s.name)}</span> ${chips(s)}</span>
+            <span class="mute small">${s.cpu}% cpu · ${s.mb} MB · ${timeAgo(s.last_active)}</span>
+            ${showReason ? `<div class="reason">${escapeHtml(s.reason)}</div>` : ""}
+            <span></span><span class="topic">${escapeHtml(s.title || s.first_prompt)}</span>
+          </div>
+          <div class="details">${liveDetails(s)}</div>
+        </div>`;
+    }
+
+    function historyRow(s) {
+      let details = section("First prompt", `<div>${escapeHtml(s.first_prompt || "-")}</div>`);
+      if (s.last_prompt) details += section("Last prompt", `<div>${escapeHtml(s.last_prompt)}</div>`);
+      if (s.pr) details += section("PR", `<a href="${escapeHtml(s.pr)}" target="_blank" rel="noopener">${escapeHtml(s.pr)}</a>`);
+      details += section("Where", `<code>${escapeHtml(s.cwd)}</code> <span class="mute small">${escapeHtml(s.sid)}</span>`);
+      return `
+        <div class="row ${expanded.has(s.sid) ? "open" : ""}" data-sid="${escapeHtml(s.sid)}">
+          <div class="head" role="button" tabindex="0" aria-expanded="${expanded.has(s.sid)}">
+            <span class="mute small">${timeAgo(s.last_active)} ago</span>
+            <span>${chips(s)}</span><span></span>
+            <span></span><span class="topic">${escapeHtml(s.title || s.first_prompt)}</span>
+          </div>
+          <div class="details">${details}${actions(s, false)}</div>
+        </div>`;
+    }
+
+    function renderLive() {
+      if (!board) return;
+      const query = $("filter").value.trim();
+      const live = board.live.filter((s) => matchesFilter(s, query));
+      const count = (state) => board.live.filter((s) => s.state === state).length;
+      const blocked = count("waiting");
+
+      document.title = (blocked ? `(${blocked}) ` : "") + "Claude sessions";
+      $("counts").innerHTML =
+        `<span class="count ${blocked ? "hot" : ""}">${blocked} blocked</span> ` +
+        `<span class="count">${count("asked")} asked you</span> ` +
+        `<span class="count">${count("busy")} working</span> ` +
+        `<span class="count">${count("idle")} done</span>`;
+
+      let html = "";
+      for (const [state, title] of GROUPS) {
+        const rows = live.filter((s) => s.state === state);
+        if (rows.length) html += `<h2>${title} (${rows.length})</h2>` + rows.map(liveRow).join("");
+      }
+      // Rebuilding the list would drop keyboard focus; put it back on the same row.
+      const focusedSid = document.activeElement?.closest?.("#live .row")?.dataset.sid;
+      $("live").innerHTML = html || '<div class="empty">No live sessions match.</div>';
+      if (focusedSid) document.querySelector(`#live .row[data-sid="${CSS.escape(focusedSid)}"] .head`)?.focus();
+    }
+
+    async function loadLive() {
+      try {
+        board = await (await fetch("/api/sessions")).json();
+        renderLive();
+      } catch {
+        $("counts").innerHTML = '<span class="count hot">board server not responding</span>';
+      }
+    }
+
+    async function loadHistory() {
+      const request = ++historyRequest;
+      const query = $("filter").value.trim();
+      let result;
+      try {
+        result = await (await fetch("/api/history?q=" + encodeURIComponent(query))).json();
+      } catch {
+        if (request === historyRequest) $("history-info").textContent = "board server not responding";
+        return;
+      }
+      if (request !== historyRequest || !historyOpen) return;
+      const n = result.rows.length;
+      $("history-info").textContent = query
+        ? `${n} match${n === 1 ? "" : "es"}${n === 100 ? " (first 100)" : ""}`
+        : `latest ${n} of ${result.total}: type in the filter to search all`;
+      $("history").innerHTML = result.rows.map(historyRow).join("") || '<div class="empty">No past sessions match.</div>';
+    }
+
+    $("history-toggle").addEventListener("click", () => {
+      historyOpen = !historyOpen;
+      $("history-toggle").textContent = historyOpen ? "Hide history" : "Show history";
+      if (historyOpen) {
+        loadHistory();
+      } else {
+        historyRequest++;
+        $("history").innerHTML = "";
+        $("history-info").textContent = "";
+      }
+    });
+
+    $("filter").addEventListener("input", () => {
+      renderLive();
+      if (historyOpen) {
+        clearTimeout(historyTimer);
+        historyTimer = setTimeout(loadHistory, 250);
+      }
+    });
+
+    document.addEventListener("click", async (event) => {
+      const copyButton = event.target.closest("[data-copy]");
+      const focusButton = event.target.closest("[data-focus]");
+      if (copyButton) {
+        try {
+          await navigator.clipboard.writeText(copyButton.dataset.copy);
+          toast("Copied: paste it in a terminal");
+        } catch {
+          toast("Copy failed: select the command text instead");
+        }
+        return;
+      }
+      if (focusButton) {
+        try {
+          const response = await fetch("/api/focus?sid=" + encodeURIComponent(focusButton.dataset.focus), { method: "POST" });
+          const message = await response.text();
+          if (message !== "ok") toast(message);
+        } catch {
+          toast("board server not responding");
+        }
+        return;
+      }
+      if (event.target.closest(".details")) return;
+      const row = event.target.closest(".row");
+      if (row) toggleRow(row);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      const head = event.target.closest(".head");
+      if (head && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        toggleRow(head.parentElement);
+      }
+    });
+
+    function toggleRow(row) {
+      const sid = row.dataset.sid;
+      expanded.has(sid) ? expanded.delete(sid) : expanded.add(sid);
+      row.classList.toggle("open");
+      row.querySelector(".head").setAttribute("aria-expanded", expanded.has(sid));
+    }
+
+    loadLive();
+    setInterval(() => {
+      // Skip a refresh while the tab is hidden or the user is selecting text to copy.
+      if (!document.hidden && !getSelection().toString()) loadLive();
+    }, POLL_MS);
+  </script>
+</body>
+</html>
