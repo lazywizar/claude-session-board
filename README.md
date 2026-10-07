@@ -109,7 +109,7 @@ edited. It stores that, plus an index of past sessions, in `board.db`.
 
 ## Privacy
 
-Everything stays on your machine. The server listens on `127.0.0.1` only and rejects requests whose
+The board adds no network traffic: it only reads local files and sends nothing anywhere. The server listens on `127.0.0.1` only and rejects requests whose
 `Host` or `Origin` isn't localhost, so web pages can't read your prompts. `board.db` holds short
 excerpts of your prompts; delete it any time.
 
