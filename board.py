@@ -284,8 +284,12 @@ def transcript_path(session_id):
 
 def process_table():
     """All processes as {pid: info}, plus {ppid: [child pids]}."""
+    # LC_ALL=C: some locales print CPU as "1,5", which float() can't parse.
     out = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,pcpu=,rss=,tty=,command="], capture_output=True, text=True
+        ["ps", "-axo", "pid=,ppid=,pcpu=,rss=,tty=,command="],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
     ).stdout
     table, children = {}, {}
     for line in out.splitlines():
