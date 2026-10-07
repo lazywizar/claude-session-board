@@ -129,8 +129,9 @@ def blocked_reason(event):
     name, tool = event.get("hook_event_name"), event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
     if name == "PreToolUse" and tool == "AskUserQuestion":
-        questions = tool_input.get("questions") or [{}]
-        return "asks: " + short(questions[0].get("question"), 140)
+        questions = tool_input.get("questions")
+        first = questions[0] if isinstance(questions, list) and questions and isinstance(questions[0], dict) else {}
+        return "asks: " + short(first.get("question") or "a question", 140)
     if name == "PreToolUse" and tool == "ExitPlanMode":
         return "plan ready for your review"
     if name == "PermissionRequest":
@@ -480,7 +481,7 @@ def build_snapshot():
                 "last_prompt": t.get("last_prompt", ""),
                 "pr": t.get("pr", ""),
                 "flow": tasks.get(session_id),
-                "last_active": t.get("mtime") or agent.get("startedAt", 0) / 1000,
+                "last_active": t.get("mtime") or (agent.get("startedAt") or 0) / 1000,
                 "subagents": subagents_of(session_id, transcript, conn, now),
                 "files": [row[0] for row in files],
                 "resume": resume_command(session_id, cwd, tasks.get(session_id), agent.get("id") if background else None),
