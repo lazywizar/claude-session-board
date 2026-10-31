@@ -67,6 +67,14 @@ class HookTests(TempHome):
         board.record_event(self.conn, self.event("PostToolUse", tool_name="Read", agent_id="sub1"), time.time())
         self.assertIn("s1", self.waiting())
 
+    def test_parallel_tool_does_not_clear_open_prompt(self):
+        board.record_event(self.conn, self.event("PermissionRequest", tool_name="Bash", tool_use_id="t1",
+                                                 tool_input={"command": "rm build"}), 1)
+        board.record_event(self.conn, self.event("PostToolUse", tool_name="Read", tool_use_id="t2"), 2)
+        self.assertIn("s1", self.waiting())
+        board.record_event(self.conn, self.event("PostToolUse", tool_name="Bash", tool_use_id="t1"), 3)
+        self.assertNotIn("s1", self.waiting())
+
     def test_stop_clears_any_prompt(self):
         board.record_event(self.conn, self.event("PreToolUse", tool_name="ExitPlanMode"), time.time())
         board.record_event(self.conn, self.event("Stop"), time.time())
@@ -170,6 +178,18 @@ class ProcessTests(unittest.TestCase):
         leftovers = {pid for pid, p in procs.items() if board.is_leftover(p, procs, children, services)}
         self.assertEqual(leftovers, {10, 13, 20})
 
+    def test_editor_windows_are_named_after_their_folder(self):
+        renderer = "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Renderer).app/Contents/MacOS/x --type=renderer"
+        host = "Cursor Helper (Plugin): extension-host (user) {} [{}-711]"
+        procs = {
+            1: {"pid": 1, "started": 100.0, "cmd": f"{renderer} --vscode-window-config=vscode:aaaa"},
+            2: {"pid": 2, "started": 101.0, "cmd": host.format("my-app", 8)},
+            3: {"pid": 3, "started": 107.0, "cmd": f"{renderer} --vscode-window-config=vscode:bbbb"},
+            4: {"pid": 4, "started": 108.0, "cmd": host.format("api server", 9)},
+            5: {"pid": 5, "started": 109.0, "cmd": f"{renderer} --vscode-window-config=vscode:bbbb"},
+        }
+        self.assertEqual(board.editor_windows(procs), {1: "my-app", 3: "api server", 5: "api server"})
+
     def test_cpu_is_measured_between_calls(self):
         def ps(cpu_time, pcpu="3.0"):
             line = f"  42     1   501  {pcpu}  {cpu_time}  05:00  20480  R  ??  node build.js\n"
@@ -223,6 +243,20 @@ class ProcessTests(unittest.TestCase):
         with mock.patch.object(board.os, "getpid", return_value=0):
             uid = board.peer_uid(client.getsockname()[1], server.getsockname()[1])
         self.assertEqual(uid, os.getuid())
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_failed_discovery_falls_back_to_the_registry(self):
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="boom")
+        registry = [{"sessionId": "s1", "pid": os.getpid()}]
+        with mock.patch.object(board.subprocess, "run", return_value=failed), \
+                mock.patch.object(board, "session_files", return_value=iter(registry)):
+            self.assertEqual(board.live_sessions(), registry)
+
+    def test_empty_discovery_is_trusted(self):
+        empty = subprocess.CompletedProcess([], 0, stdout="[]\n", stderr="")
+        with mock.patch.object(board.subprocess, "run", return_value=empty):
+            self.assertEqual(board.live_sessions(), [])
 
 
 class ServerTests(unittest.TestCase):

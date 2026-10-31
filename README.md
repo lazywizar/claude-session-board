@@ -84,6 +84,9 @@ and don't rename tabs by hand (a manual tab name hides the one Claude sets).
   one desktop notification per process.
 - **Busiest processes right now**, each labeled with its owner: a session by name, a leftover,
   an app, or the system. 100% means one full core, so a parallel build can show several hundred.
+  A VS Code, Cursor or Windsurf window is named by its folder, with the Claude sessions working
+  there: the window draws all its terminal tabs, so a session streaming output shows up as
+  the window's CPU. **Developer: Reload Window** frees it without stopping any session.
 - **Leftovers**: dev tools (node, python, test runners, bundlers, headless browsers...) whose
   parent is gone. When a terminal tab or session closes, what it started keeps running under
   pid 1. Each leftover shows its whole process tree, the folder it runs in, and the live session

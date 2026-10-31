@@ -259,6 +259,18 @@
       return `<button class="kill" data-kill="${p.pid}" data-started="${p.started}" ${force ? 'data-force="1"' : ""}>${force ? "Force kill" : "Kill"}</button>`;
     }
 
+    // An editor window's renderer draws every terminal tab in it, so a Claude session
+    // streaming output there shows up as the window's CPU. Name the likely culprits.
+    function windowNote(sessions) {
+      const busyFirst = { busy: 0, waiting: 1, asked: 2, idle: 3 };
+      const names = [...sessions]
+        .sort((a, b) => busyFirst[a.state] - busyFirst[b.state])
+        .map((s) => `<strong>${escapeHtml(s.name)}</strong> <span class="mute">${LABELS[s.state]}</span>`);
+      return `<div>Claude sessions in this folder: ${names.join(", ") || '<span class="mute">none</span>'}</div>
+        <div class="mute">This process draws the whole window: the editor and all its terminal tabs. To free it without
+        stopping any session, run <strong>Developer: Reload Window</strong> in that window; terminals reconnect.</div>`;
+    }
+
     // One row per process. `label` says who owns it; leftovers also say where they were started.
     function processTable(procs, showLabel = false) {
       const rows = procs.map((p) => `
@@ -267,7 +279,7 @@
           ${showLabel ? `<td>${escapeHtml(p.label)}</td>` : ""}
           <td class="num optional" title="running for">${duration(Date.now() / 1000 - p.started)}</td>
           <td class="num optional">${p.mb} MB${p.count > 1 ? ` · ${p.count} procs` : ""}</td>
-          <td class="command">${escapeHtml(p.cmd)}${p.cwd ? `<div class="mute">in ${escapeHtml(p.cwd)}</div>` : ""}</td>
+          <td class="command">${p.sessions ? windowNote(p.sessions) : escapeHtml(p.cmd)}${p.cwd ? `<div class="mute">in ${escapeHtml(p.cwd)}</div>` : ""}</td>
           <td class="num">${killButton(p)} <span class="mute">pid ${p.pid}</span></td>
         </tr>`);
       return `<table class="procs">${rows.join("")}</table>`;

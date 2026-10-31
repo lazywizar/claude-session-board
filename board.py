@@ -33,6 +33,7 @@ DATA_DIR = os.environ.get("CLAUDE_BOARD_DATA", os.path.join(CLAUDE_DIR, "session
 DB_PATH = os.path.join(DATA_DIR, "board.db")
 PORT = int(os.environ.get("CLAUDE_BOARD_PORT", "7777"))
 CLAUDE_BIN = shutil.which("claude") or os.path.join(HOME, ".local/bin/claude")
+LSOF_BIN = shutil.which("lsof") or "/usr/sbin/lsof"  # launchd's default PATH has no /usr/sbin
 
 # Optional: flow (a task manager that binds tasks to Claude sessions). Ignored if absent.
 FLOW_DB = os.path.join(HOME, ".flow/flow.db")
@@ -57,7 +58,7 @@ def connect():
     conn.executescript(
         """
         create table if not exists waiting (
-            id text primary key, reason text, agent text, since real);
+            id text primary key, reason text, agent text, since real, tool_use_id text);
         create table if not exists subagents (
             id text, agent text, type text, started real, ended real,
             primary key (id, agent));
@@ -68,6 +69,10 @@ def connect():
             last_prompt text, pr text, mtime real);
         """
     )
+    try:  # databases created before tool_use_id was tracked
+        conn.execute("alter table waiting add column tool_use_id text")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -158,20 +163,31 @@ def record_event(conn, event, now):
     agent = event.get("agent_id") or ""
     tool = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
+    tool_use_id = event.get("tool_use_id")
 
     reason = blocked_reason(event)
     with conn:
         if reason:
             inserted = conn.execute(
-                "insert into waiting values (?, ?, ?, ?) on conflict (id) do nothing",
-                (session_id, reason, agent, now),
+                "insert into waiting (id, reason, agent, since, tool_use_id) values (?, ?, ?, ?, ?)"
+                " on conflict (id) do nothing",
+                (session_id, reason, agent, now, tool_use_id),
             ).rowcount
+            if not inserted and tool_use_id:
+                # A Notification (which has no tool_use_id) may have opened this wait first.
+                conn.execute(
+                    "update waiting set tool_use_id = ? where id = ? and tool_use_id is null",
+                    (tool_use_id, session_id),
+                )
             return reason, inserted == 1
 
         if name in ("PostToolUse", "PostToolUseFailure"):
-            # The dialog was answered. Only the agent that opened it can clear it,
-            # so a background subagent finishing a tool doesn't hide a real prompt.
-            conn.execute("delete from waiting where id = ? and agent = ?", (session_id, agent))
+            # The dialog was answered once the tool call that opened it finishes. Other
+            # tools running in parallel, or in a background subagent, don't count.
+            conn.execute(
+                "delete from waiting where id = ? and agent = ? and (tool_use_id is null or tool_use_id = ?)",
+                (session_id, agent, tool_use_id),
+            )
             path = tool_input.get("file_path") or tool_input.get("notebook_path")
             if name == "PostToolUse" and tool in EDIT_TOOLS and path:
                 conn.execute(
@@ -415,8 +431,9 @@ def flow_tasks():
 def live_sessions():
     """Running sessions from `claude agents --json`, or the per-process registry as a fallback."""
     try:
-        out = subprocess.run([CLAUDE_BIN, "agents", "--json"], capture_output=True, text=True, timeout=20).stdout
-        return json.loads(out or "[]")
+        result = subprocess.run([CLAUDE_BIN, "agents", "--json"], capture_output=True, text=True, timeout=20)
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     sessions = []
@@ -486,6 +503,11 @@ NOT_LEFTOVER = re.compile(r"^/(System|Applications)/|^/Library/Apple/|ClaudeCode
 SUBREAPER = re.compile(r"\bsystemd --user\b")
 # Shells re-parent the prompt helper they started (powerlevel10k's gitstatusd); on its own it means nothing is running.
 PROMPT_HELPER = re.compile(r"gitstatusd")
+# VS Code and its forks (Cursor, Windsurf) run one renderer per window, which draws the
+# editor and every terminal tab in it. Its command line carries a window id but no folder.
+WINDOW_ID = re.compile(r"--vscode-window-config=vscode:([0-9a-f-]+)")
+# ...while each window's extension host is titled with its folder: "extension-host (user) my-app [10-719]".
+EXTENSION_HOST = re.compile(r"extension-host \(user\) (.+?) \[\d+-")
 HOT_CHECK_SECONDS = 15  # how often the server samples CPU when nobody has the page open
 
 _hot_since, _hot_notified = {}, set()
@@ -535,13 +557,39 @@ def is_leftover(proc, procs, children, services=frozenset()):
     return bool(DEV_TOOL.fullmatch(name))
 
 
+def editor_windows(procs):
+    """{renderer pid: folder name} for VS Code-style editor windows.
+
+    Nothing links a renderer to its folder directly, but a window starts its renderer
+    and then, a few seconds later, its extension host. So pair each window, oldest
+    first, with the first unclaimed extension host that started within a minute of it.
+    """
+    windows = {}  # window id -> (start time, [renderer pids])
+    for proc in procs.values():
+        match = WINDOW_ID.search(proc["cmd"])
+        if match:
+            start, pids = windows.get(match.group(1), (proc["started"], []))
+            windows[match.group(1)] = (min(start, proc["started"]), pids + [proc["pid"]])
+    hosts = sorted(
+        (p["started"], m.group(1)) for p in procs.values() for m in [EXTENSION_HOST.search(p["cmd"])] if m
+    )
+    folders, claimed = {}, set()
+    for start, pids in sorted(windows.values()):
+        for i, (host_start, folder) in enumerate(hosts):
+            if i not in claimed and -2 <= host_start - start <= 60:
+                claimed.add(i)
+                folders.update(dict.fromkeys(pids, folder))
+                break
+    return folders
+
+
 def working_dirs(pids):
     """{pid: current directory} for a few processes, in one lsof call. {} if lsof isn't available."""
     if not pids:
         return {}
     try:
         out = subprocess.run(
-            ["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))],
+            [LSOF_BIN, "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))],
             capture_output=True,
             text=True,
             timeout=10,
@@ -565,11 +613,15 @@ def machine_report(procs, children, sessions, now):
             for pid in [s["pid"], *descendants(s["pid"], children)]:
                 owner[pid] = s["name"]
     session_pids = {s["pid"] for s in sessions}
+    windows = editor_windows(procs)
     services = service_pids([p["pid"] for p in procs.values() if orphaned(p, procs)])
     leftover_roots = {pid for pid, p in procs.items() if is_leftover(p, procs, children, services)}
 
     def describe(proc):
         """(label, killable): who a process belongs to, and whether the page offers Kill for it."""
+        if proc["pid"] in windows:
+            app = re.search(r"/([^/]+)\.app/", proc["cmd"])
+            return f"{app.group(1) if app else 'editor'} window: {windows[proc['pid']]}", False
         ancestor, seen = proc, set()
         while ancestor and ancestor["pid"] not in seen:
             if ancestor["pid"] in owner:
@@ -597,12 +649,20 @@ def machine_report(procs, children, sessions, now):
         if row["cwd"] in session_dirs:
             row["label"] = "leftover, likely from " + session_dirs[row["cwd"]]
 
+    def row(proc):
+        result = process_row(proc, *describe(proc))
+        if proc["pid"] in windows:
+            # The window's CPU is mostly its terminals, so name the sessions likely running in it.
+            folder = windows[proc["pid"]].lower()
+            result["sessions"] = [{"name": s["name"], "state": s["state"]} for s in sessions if s["repo"].lower() == folder]
+        return result
+
     busiest = sorted(procs.values(), key=lambda p: -p["cpu"])[:10]
     return {
         "load": round(os.getloadavg()[0], 1),
         "cores": os.cpu_count() or 1,
-        "top": [process_row(p, *describe(p)) for p in busiest],
-        "hot": track_hot(procs, describe, now),
+        "top": [row(p) for p in busiest],
+        "hot": track_hot(procs, row, now),
         "leftovers": leftovers,
         "zombies": [
             {"pid": p["pid"], "parent": p["ppid"], "parent_cmd": short(procs.get(p["ppid"], {}).get("cmd", "?"), 100)}
@@ -612,7 +672,7 @@ def machine_report(procs, children, sessions, now):
     }
 
 
-def track_hot(procs, describe, now):
+def track_hot(procs, row, now):
     """Processes above HOT_CPU for HOT_SECONDS. Sends one desktop notification for any that just crossed the line."""
     hot, new = [], []
     for proc in procs.values():
@@ -622,7 +682,7 @@ def track_hot(procs, describe, now):
         since = _hot_since.setdefault(proc["pid"], now)
         if now - since < HOT_SECONDS:
             continue
-        hot.append({**process_row(proc, *describe(proc)), "hot_for": now - since})
+        hot.append({**row(proc), "hot_for": now - since})
         if proc["pid"] not in _hot_notified:
             _hot_notified.add(proc["pid"])
             new.append(proc)
@@ -631,7 +691,7 @@ def track_hot(procs, describe, now):
     _hot_notified.intersection_update(procs.keys())
     if new:
         worst = max(new, key=lambda p: p["cpu"])
-        title = f"High CPU: {describe(worst)[0]}" if len(new) == 1 else f"High CPU: {len(new)} processes"
+        title = f"High CPU: {row(worst)['label']}" if len(new) == 1 else f"High CPU: {len(new)} processes"
         message = f"{worst['cpu']:.0f}% for {HOT_SECONDS // 60}+ min: {short(worst['cmd'], 80)}"
         threading.Thread(target=notify, args=(title, message), daemon=True).start()
     return sorted(hot, key=lambda h: -h["cpu"])
@@ -947,7 +1007,7 @@ def peer_uid(client_port, server_port):
         return None
     try:
         out = subprocess.run(
-            ["lsof", "-nP", f"-iTCP@127.0.0.1:{client_port}", "-sTCP:ESTABLISHED", "-Fpu"],
+            [LSOF_BIN, "-nP", f"-iTCP@127.0.0.1:{client_port}", "-sTCP:ESTABLISHED", "-Fpu"],
             capture_output=True,
             text=True,
             timeout=5,
