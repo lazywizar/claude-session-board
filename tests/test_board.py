@@ -12,6 +12,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import board  # noqa: E402
 
 
+def wait_for(read, done, timeout=5):
+    """Poll `read()` until `done(value)`, so process tests hold up on a busy machine."""
+    deadline = time.time() + timeout
+    while True:
+        value = read()
+        if done(value):
+            return value
+        if time.time() > deadline:
+            raise AssertionError(f"timed out waiting; last value: {value!r}"[:300])
+        time.sleep(0.05)
+
+
 class TempHome(unittest.TestCase):
     """Points the board at a throwaway ~/.claude and database."""
 
@@ -36,6 +48,11 @@ class TempHome(unittest.TestCase):
 
     def waiting(self):
         return dict(self.conn.execute("select id, reason from waits order by since desc"))
+
+
+class StorageTests(TempHome):
+    def test_data_folder_is_private(self):
+        self.assertEqual(os.stat(board.DATA_DIR).st_mode & 0o777, 0o700)
 
 
 class HookTests(TempHome):
@@ -237,8 +254,7 @@ class ProcessTests(unittest.TestCase):
     def test_kill_stops_the_whole_tree(self):
         shell = subprocess.Popen(["sh", "-c", "sleep 60; true"])
         self.addCleanup(shell.kill)
-        time.sleep(0.3)
-        procs, children = board.process_table()
+        procs, children = wait_for(lambda: board.process_table(), lambda table: shell.pid in table[1])
         sleeper = children[shell.pid][0]
 
         ok, message = board.kill_tree(shell.pid, procs[shell.pid]["started"] - 60)
@@ -248,8 +264,7 @@ class ProcessTests(unittest.TestCase):
         ok, _ = board.kill_tree(shell.pid, procs[shell.pid]["started"])
         self.assertTrue(ok)
         shell.wait(timeout=5)
-        time.sleep(0.2)
-        self.assertNotIn(sleeper, board.process_table()[0])
+        wait_for(lambda: board.process_table()[0], lambda table: sleeper not in table)
 
     def test_kill_refuses_the_boards_own_ancestors(self):
         procs, _ = board.process_table()

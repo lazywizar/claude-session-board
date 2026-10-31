@@ -52,7 +52,10 @@ PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.html
 
 
 def connect():
-    os.makedirs(DATA_DIR, exist_ok=True)
+    # board.db holds excerpts of your prompts: keep the folder private to you,
+    # including one created by an older version or with a loose umask.
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("pragma journal_mode=wal")
     conn.executescript(
