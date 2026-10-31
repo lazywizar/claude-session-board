@@ -35,7 +35,7 @@ class TempHome(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def waiting(self):
-        return dict(self.conn.execute("select id, reason from waiting"))
+        return dict(self.conn.execute("select id, reason from waits order by since desc"))
 
 
 class HookTests(TempHome):
@@ -74,6 +74,24 @@ class HookTests(TempHome):
         self.assertIn("s1", self.waiting())
         board.record_event(self.conn, self.event("PostToolUse", tool_name="Bash", tool_use_id="t1"), 3)
         self.assertNotIn("s1", self.waiting())
+
+    def test_each_open_prompt_is_kept(self):
+        _, first = board.record_event(self.conn, self.event("PermissionRequest", tool_name="Bash", agent_id="a",
+                                                            tool_use_id="t1", tool_input={"command": "x"}), 1)
+        _, second = board.record_event(self.conn, self.event("PermissionRequest", tool_name="Bash", agent_id="b",
+                                                             tool_use_id="t2", tool_input={"command": "y"}), 2)
+        self.assertEqual((first, second), (True, False))  # one notification per blocked session
+        board.record_event(self.conn, self.event("PostToolUse", tool_name="Bash", agent_id="a", tool_use_id="t1"), 3)
+        self.assertEqual(self.waiting(), {"s1": "approve Bash: y"})
+        board.record_event(self.conn, self.event("PostToolUse", tool_name="Bash", agent_id="b", tool_use_id="t2"), 4)
+        self.assertEqual(self.waiting(), {})
+
+    def test_notification_first_then_permission_request(self):
+        board.record_event(self.conn, self.event("Notification", notification_type="permission_prompt", message="x"), 1)
+        board.record_event(self.conn, self.event("PermissionRequest", tool_name="Bash", tool_use_id="t1",
+                                                 tool_input={"command": "x"}), 2)
+        board.record_event(self.conn, self.event("PostToolUse", tool_name="Read", tool_use_id="t9"), 3)
+        self.assertIn("s1", self.waiting())  # the wait is tied to t1 now, so t9 doesn't clear it
 
     def test_stop_clears_any_prompt(self):
         board.record_event(self.conn, self.event("PreToolUse", tool_name="ExitPlanMode"), time.time())

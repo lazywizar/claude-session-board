@@ -57,8 +57,9 @@ def connect():
     conn.execute("pragma journal_mode=wal")
     conn.executescript(
         """
-        create table if not exists waiting (
-            id text primary key, reason text, agent text, since real, tool_use_id text);
+        create table if not exists waits (
+            id text, agent text, call text, reason text, since real,
+            primary key (id, agent, call));
         create table if not exists subagents (
             id text, agent text, type text, started real, ended real,
             primary key (id, agent));
@@ -69,10 +70,6 @@ def connect():
             last_prompt text, pr text, mtime real);
         """
     )
-    try:  # databases created before tool_use_id was tracked
-        conn.execute("alter table waiting add column tool_use_id text")
-    except sqlite3.OperationalError:
-        pass
     return conn
 
 
@@ -157,36 +154,46 @@ def blocked_reason(event):
     return None
 
 
+def wait_key(event):
+    """Which open dialog an event is about: (agent, tool call). Notifications carry no
+    tool call id, so theirs is ""."""
+    return event.get("agent_id") or "", event.get("tool_use_id") or ""
+
+
 def record_event(conn, event, now):
-    """Apply one hook event to the database. Returns (reason, newly_blocked)."""
+    """Apply one hook event to the database. Returns (reason, newly_blocked).
+
+    A session can have several dialogs open at once (two subagents each asking for
+    permission), so every open one is its own row in `waits`, keyed by agent and tool
+    call. The session counts as blocked while any row is left.
+    """
     session_id, name = event.get("session_id"), event.get("hook_event_name")
-    agent = event.get("agent_id") or ""
+    agent, call = wait_key(event)
     tool = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
-    tool_use_id = event.get("tool_use_id")
 
     reason = blocked_reason(event)
     with conn:
         if reason:
+            already_blocked = conn.execute("select 1 from waits where id = ?", (session_id,)).fetchone()
+            same_agent = conn.execute("select call from waits where id = ? and agent = ?", (session_id, agent)).fetchall()
+            if not call and same_agent:
+                return reason, False  # a Notification for a dialog we already know about
+            if call and ("",) in same_agent:
+                # The Notification arrived first: now we know which tool call it was for.
+                conn.execute("delete from waits where id = ? and agent = ? and call = ''", (session_id, agent))
             inserted = conn.execute(
-                "insert into waiting (id, reason, agent, since, tool_use_id) values (?, ?, ?, ?, ?)"
-                " on conflict (id) do nothing",
-                (session_id, reason, agent, now, tool_use_id),
+                "insert into waits values (?, ?, ?, ?, ?) on conflict do nothing",
+                (session_id, agent, call, reason, now),
             ).rowcount
-            if not inserted and tool_use_id:
-                # A Notification (which has no tool_use_id) may have opened this wait first.
-                conn.execute(
-                    "update waiting set tool_use_id = ? where id = ? and tool_use_id is null",
-                    (tool_use_id, session_id),
-                )
-            return reason, inserted == 1
+            return reason, bool(inserted) and not already_blocked
 
         if name in ("PostToolUse", "PostToolUseFailure"):
-            # The dialog was answered once the tool call that opened it finishes. Other
-            # tools running in parallel, or in a background subagent, don't count.
+            # A dialog is answered once the tool call that opened it finishes. Other tools
+            # running in parallel, or in another subagent, don't count.
             conn.execute(
-                "delete from waiting where id = ? and agent = ? and (tool_use_id is null or tool_use_id = ?)",
-                (session_id, agent, tool_use_id),
+                "delete from waits where id = ? and agent = ? and call in ('', ?)",
+                (session_id, agent, call),
             )
             path = tool_input.get("file_path") or tool_input.get("notebook_path")
             if name == "PostToolUse" and tool in EDIT_TOOLS and path:
@@ -195,7 +202,7 @@ def record_event(conn, event, now):
                     (session_id, path, now),
                 )
         elif name in ("UserPromptSubmit", "Stop", "SessionStart", "SessionEnd"):
-            conn.execute("delete from waiting where id = ?", (session_id,))
+            conn.execute("delete from waits where id = ?", (session_id,))
         elif name == "SubagentStart":
             conn.execute(
                 "insert or replace into subagents values (?, ?, ?, ?, null)",
@@ -221,7 +228,10 @@ def run_hook():
     # Most permission prompts in auto mode resolve on their own. Only bother the
     # user if this one is still open after a few seconds.
     time.sleep(NOTIFY_DELAY)
-    row = conn.execute("select since from waiting where id = ?", (event["session_id"],)).fetchone()
+    agent, call = wait_key(event)
+    row = conn.execute(
+        "select since from waits where id = ? and agent = ? and call = ?", (event["session_id"], agent, call)
+    ).fetchone()
     if row and row[0] == now:  # still the same wait this hook started, not a newer one
         notify(f"Claude needs you: {session_name(event['session_id'])}", reason)
 
@@ -801,7 +811,8 @@ def build_snapshot(cpu_samples=None, with_machine=False):
 
     procs, children = process_table(cpu_samples)
     tasks = flow_tasks()
-    waiting = dict(conn.execute("select id, reason from waiting"))
+    # Oldest open dialog per session: dict() keeps the last row for each id.
+    waiting = dict(conn.execute("select id, reason from waits order by since desc"))
     live = []
     for agent in live_sessions():
         session_id = agent.get("sessionId")
@@ -1096,7 +1107,7 @@ def serve():
     # than a few days is almost certainly from a session that died mid-prompt.
     conn.execute("delete from files where ts < ?", (now - 14 * 86400,))
     conn.execute("delete from subagents where started < ?", (now - 14 * 86400,))
-    conn.execute("delete from waiting where since < ?", (now - 3 * 86400,))
+    conn.execute("delete from waits where since < ?", (now - 3 * 86400,))
     conn.commit()
     threading.Thread(target=sample_forever, daemon=True).start()
     print(f"claude-session-board on http://127.0.0.1:{PORT}", flush=True)
