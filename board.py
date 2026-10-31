@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,8 @@ NOTIFY_DELAY = 4  # seconds a session must stay blocked before we show a desktop
 HEAD_BYTES = 256 * 1024  # enough to find the first prompt
 TAIL_BYTES = 512 * 1024  # enough to find the latest title, prompt and reply
 STATE_ORDER = {"waiting": 0, "asked": 1, "busy": 2, "idle": 3}
+HOT_CPU = 80  # percent of one core
+HOT_SECONDS = 120  # how long a process has to stay above HOT_CPU before we call it out
 PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "board.html")
 
 
@@ -292,31 +295,86 @@ def transcript_path(session_id):
     return matches[0] if matches else ""
 
 
-def process_table():
-    """All processes as {pid: info}, plus {ppid: [child pids]}."""
+def ps_seconds(text):
+    """Seconds from a ps duration such as "12:03.51", "01:02:03" or "3-04:05:06"."""
+    days, _, clock = text.rpartition("-")
+    seconds = 0.0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds + int(days or 0) * 86400
+
+
+def linux_cpu_seconds(pid):
+    """CPU time from /proc. Linux ps rounds it to whole seconds, too coarse to sample every few seconds."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            # The command name can contain spaces and parentheses, so split after its closing ")".
+            fields = f.read().rsplit(b")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")  # utime + stime
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_table(cpu_samples=None):
+    """All processes as {pid: info}, plus {ppid: [child pids]}.
+
+    By default "cpu" is ps's own %cpu. On macOS that is a decaying average: it lags by
+    a minute and smooths spikes away, which hides exactly the runaway build you are
+    looking for. Pass a dict that you keep between calls as `cpu_samples` and "cpu"
+    becomes the share of one core each process really used since the previous call.
+    """
     # LC_ALL=C: some locales print CPU as "1,5", which float() can't parse.
     out = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,pcpu=,rss=,tty=,command="],
+        ["ps", "-axo", "pid=,ppid=,uid=,pcpu=,time=,etime=,rss=,stat=,tty=,command="],
         capture_output=True,
         text=True,
         env={**os.environ, "LC_ALL": "C"},
     ).stdout
-    table, children = {}, {}
+    now, table, children = time.time(), {}, {}
     for line in out.splitlines():
-        parts = line.split(None, 5)
-        if len(parts) < 6:
+        parts = line.split(None, 9)
+        if len(parts) < 10:
             continue
         pid, ppid = int(parts[0]), int(parts[1])
+        cpu = float(parts[3])
+        if cpu_samples is not None:
+            used = linux_cpu_seconds(pid) if sys.platform.startswith("linux") else None
+            used = ps_seconds(parts[4]) if used is None else used
+            previous = cpu_samples.get(pid)
+            if not previous or now - previous[1] >= 1:  # shorter gaps are too noisy to measure
+                if previous:
+                    cpu = max(0.0, 100 * (used - previous[0]) / (now - previous[1]))
+                cpu_samples[pid] = (used, now)
         table[pid] = {
             "pid": pid,
             "ppid": ppid,
-            "cpu": float(parts[2]),
-            "mb": int(parts[3]) // 1024,
-            "tty": parts[4],
-            "cmd": parts[5],
+            "uid": int(parts[2]),
+            "cpu": round(cpu, 1),
+            "started": now - ps_seconds(parts[5]),
+            "mb": int(parts[6]) // 1024,
+            "stat": parts[7],
+            "tty": parts[8],
+            "cmd": parts[9],
         }
         children.setdefault(ppid, []).append(pid)
+    if cpu_samples is not None:
+        for pid in cpu_samples.keys() - table.keys():
+            del cpu_samples[pid]
     return table, children
+
+
+def process_row(proc, label="", killable=False):
+    """What the page needs to show one process. Kill is only offered for your own
+    session children and leftovers, never for apps or the system."""
+    return {
+        "pid": proc["pid"],
+        "cpu": proc["cpu"],
+        "mb": proc["mb"],
+        "started": proc["started"],
+        "cmd": short(proc["cmd"], 140),
+        "label": label,
+        "killable": killable and proc["uid"] == os.getuid(),
+    }
 
 
 def descendants(pid, children):
@@ -338,7 +396,7 @@ def process_stats(pid, procs, children):
         "tty": procs[pid]["tty"],
         "cpu": round(sum(p["cpu"] for p in tree), 1),
         "mb": sum(p["mb"] for p in tree),
-        "procs": [{"pid": p["pid"], "cpu": p["cpu"], "cmd": short(p["cmd"], 110)} for p in busiest],
+        "procs": [process_row(p, killable=True) for p in busiest],
     }
 
 
@@ -413,10 +471,227 @@ def resume_command(session_id, cwd, task=None, background_id=None):
     return f"cd {shlex.quote(cwd or HOME)} && claude --resume {session_id}"
 
 
+# ---------------------------------------------------------------- the whole machine
+
+# Programs a coding session typically leaves running: dev servers, test runners, watchers, builds.
+DEV_TOOL = re.compile(
+    r"node|python[\d.]*|Python|ruby|java|go|cargo|rustc|make|gradle|deno|bun|npm|npx|pnpm|yarn|"
+    r"tsc|vite|esbuild|webpack|jest|vitest|pytest|uvicorn|gunicorn|celery|playwright|"
+    r"chrome|Chromium|chrome-headless-shell|headless_shell|mongod|redis-server|postgres"
+)
+SHELL = re.compile(r"(ba|z|da|fi)?sh")
+# Never leftovers: apps, the OS, Claude Code's own background daemon, and this board.
+NOT_LEFTOVER = re.compile(r"^/(System|Applications)/|^/Library/Apple/|ClaudeCode\.app|--bg-pty-host|--bg-spare|board\.py")
+# Where orphans end up: pid 1, or on Linux desktops usually the per-user systemd.
+SUBREAPER = re.compile(r"\bsystemd --user\b")
+# Shells re-parent the prompt helper they started (powerlevel10k's gitstatusd); on its own it means nothing is running.
+PROMPT_HELPER = re.compile(r"gitstatusd")
+HOT_CHECK_SECONDS = 15  # how often the server samples CPU when nobody has the page open
+
+_hot_since, _hot_notified = {}, set()
+
+
+def program_name(cmd):
+    """"node" for "/usr/local/bin/node server.js", "zsh" for a login shell's "-zsh"."""
+    first = cmd.split(None, 1)[0] if cmd.strip() else ""
+    return os.path.basename(first).lstrip("-")
+
+
+def service_pids(candidates):
+    """Pids started by the OS service manager (brew services, systemd units): running on purpose."""
+    if sys.platform == "darwin":
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+        return {int(line.split()[0]) for line in out.splitlines() if line.split()[:1] and line.split()[0].isdigit()}
+    services = set()
+    for pid in candidates:
+        try:
+            with open(f"/proc/{pid}/cgroup", encoding="utf-8") as f:
+                if f.read().strip().endswith(".service"):
+                    services.add(pid)
+        except OSError:
+            pass
+    return services
+
+
+def orphaned(proc, procs):
+    parent = procs.get(proc["ppid"])
+    return proc["ppid"] == 1 or bool(parent and SUBREAPER.search(parent["cmd"]))
+
+
+def is_leftover(proc, procs, children, services=frozenset()):
+    """True for one of your dev tools whose parent is gone.
+
+    When a terminal tab or Claude session closes, whatever it started is re-parented
+    and keeps running: a dev server, a test watcher, a build stuck in a loop. A
+    re-parented shell only counts if something is still running under it.
+    """
+    if proc["uid"] != os.getuid() or proc["pid"] in services or NOT_LEFTOVER.search(proc["cmd"]):
+        return False
+    if not orphaned(proc, procs):
+        return False
+    name = program_name(proc["cmd"])
+    if SHELL.fullmatch(name):
+        return any(c in procs and not PROMPT_HELPER.search(procs[c]["cmd"]) for c in children.get(proc["pid"], []))
+    return bool(DEV_TOOL.fullmatch(name))
+
+
+def working_dirs(pids):
+    """{pid: current directory} for a few processes, in one lsof call. {} if lsof isn't available."""
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    dirs, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            dirs[pid] = line[1:]
+    return dirs
+
+
+def machine_report(procs, children, sessions, now):
+    """Load, the busiest processes, leftovers, zombies, and anything that has been hot for a while."""
+    owner = {}  # pid -> name of the live session it belongs to
+    for s in sessions:
+        if s["pid"] in procs:
+            for pid in [s["pid"], *descendants(s["pid"], children)]:
+                owner[pid] = s["name"]
+    session_pids = {s["pid"] for s in sessions}
+    services = service_pids([p["pid"] for p in procs.values() if orphaned(p, procs)])
+    leftover_roots = {pid for pid, p in procs.items() if is_leftover(p, procs, children, services)}
+
+    def describe(proc):
+        """(label, killable): who a process belongs to, and whether the page offers Kill for it."""
+        ancestor, seen = proc, set()
+        while ancestor and ancestor["pid"] not in seen:
+            if ancestor["pid"] in owner:
+                # Not the session's own claude process: close the session for that.
+                return "session: " + owner[ancestor["pid"]], proc["pid"] not in session_pids
+            if ancestor["pid"] in leftover_roots:
+                return "leftover", True
+            seen.add(ancestor["pid"])
+            ancestor = procs.get(ancestor["ppid"])
+        app = re.search(r"/([^/]+)\.app/", proc["cmd"])
+        return (app.group(1) if app else "system"), False
+
+    leftovers = []
+    for pid in leftover_roots:
+        # Report the whole tree: a stuck build is usually a parent and many workers.
+        tree = [procs[p] for p in [pid, *descendants(pid, children)] if p in procs]
+        row = process_row(procs[pid], "leftover", killable=True)
+        row.update(cpu=round(sum(p["cpu"] for p in tree), 1), mb=sum(p["mb"] for p in tree), count=len(tree))
+        leftovers.append(row)
+    leftovers = sorted(leftovers, key=lambda r: (-r["cpu"], -r["mb"]))[:30]
+    dirs = working_dirs([r["pid"] for r in leftovers])
+    session_dirs = {s["cwd"]: s["name"] for s in sessions if s["cwd"]}
+    for row in leftovers:
+        row["cwd"] = dirs.get(row["pid"], "")
+        if row["cwd"] in session_dirs:
+            row["label"] = "leftover, likely from " + session_dirs[row["cwd"]]
+
+    busiest = sorted(procs.values(), key=lambda p: -p["cpu"])[:10]
+    return {
+        "load": round(os.getloadavg()[0], 1),
+        "cores": os.cpu_count() or 1,
+        "top": [process_row(p, *describe(p)) for p in busiest],
+        "hot": track_hot(procs, describe, now),
+        "leftovers": leftovers,
+        "zombies": [
+            {"pid": p["pid"], "parent": p["ppid"], "parent_cmd": short(procs.get(p["ppid"], {}).get("cmd", "?"), 100)}
+            for p in procs.values()
+            if p["stat"].startswith("Z")
+        ],
+    }
+
+
+def track_hot(procs, describe, now):
+    """Processes above HOT_CPU for HOT_SECONDS. Sends one desktop notification for any that just crossed the line."""
+    hot, new = [], []
+    for proc in procs.values():
+        if proc["cpu"] < HOT_CPU:
+            _hot_since.pop(proc["pid"], None)
+            continue
+        since = _hot_since.setdefault(proc["pid"], now)
+        if now - since < HOT_SECONDS:
+            continue
+        hot.append({**process_row(proc, *describe(proc)), "hot_for": now - since})
+        if proc["pid"] not in _hot_notified:
+            _hot_notified.add(proc["pid"])
+            new.append(proc)
+    for pid in _hot_since.keys() - procs.keys():
+        del _hot_since[pid]
+    _hot_notified.intersection_update(procs.keys())
+    if new:
+        worst = max(new, key=lambda p: p["cpu"])
+        title = f"High CPU: {describe(worst)[0]}" if len(new) == 1 else f"High CPU: {len(new)} processes"
+        message = f"{worst['cpu']:.0f}% for {HOT_SECONDS // 60}+ min: {short(worst['cmd'], 80)}"
+        threading.Thread(target=notify, args=(title, message), daemon=True).start()
+    return sorted(hot, key=lambda h: -h["cpu"])
+
+
+def kill_tree(pid, started, force=False):
+    """Stop a process and everything it started. Returns (ok, message).
+
+    `started` is the start time the page showed. If it doesn't match, the pid now
+    belongs to a different process and we leave it alone.
+    """
+    if os.getuid() == 0:
+        return False, "The board is running as root, so Kill is turned off."
+    procs, children = process_table()
+    proc = procs.get(pid)
+    if not proc or abs(proc["started"] - started) > 2:
+        return False, "That process has already exited."
+    if proc["uid"] != os.getuid():
+        return False, "Can't kill that one: it belongs to another user."
+    board_and_ancestors, ancestor = set(), os.getpid()
+    while ancestor in procs and ancestor not in board_and_ancestors:
+        board_and_ancestors.add(ancestor)
+        ancestor = procs[ancestor]["ppid"]
+    tree = [pid, *descendants(pid, children)]
+    if pid <= 1 or board_and_ancestors & set(tree):
+        return False, "Can't kill that one: the board itself is running inside it."
+    tree = [p for p in tree if procs.get(p, {}).get("uid") == os.getuid()]
+
+    def send(sig):
+        for target in tree:
+            try:
+                os.kill(target, sig)
+            except OSError:  # exited in the meantime
+                pass
+
+    # Freeze the whole tree first, so a watcher such as nodemon can't restart a child
+    # in the moment between that child's signal and its own.
+    send(signal.SIGSTOP)
+    send(signal.SIGKILL if force else signal.SIGTERM)
+    if force:
+        return True, f"Force-killed {len(tree)} process(es)."
+    send(signal.SIGCONT)  # a stopped process only acts on SIGTERM once it runs again
+    return True, f"Asked {len(tree)} process(es) to stop. If it's still listed in a few seconds, use Force kill."
+
+
+def sample_forever():
+    """Keep CPU samples and hot alerts current even when no browser has the board open."""
+    while True:
+        try:
+            snapshot()
+        except Exception as error:  # keep sampling; one bad read shouldn't end alerts for good
+            print(f"sampling failed: {error!r}", file=sys.stderr, flush=True)
+        time.sleep(HOT_CHECK_SECONDS)
+
+
 # ---------------------------------------------------------------- the board snapshot
 
 _cache_lock = threading.Lock()
 _cache = {"at": 0.0, "data": None, "history_synced_at": 0.0}
+_cpu_samples = {}  # only snapshot() uses this, under _cache_lock, so the CPU baseline stays steady
 
 
 def sync_history(conn):
@@ -458,13 +733,13 @@ def session_state(session_id, status, transcript_info, waiting):
     return "idle", ""
 
 
-def build_snapshot():
+def build_snapshot(cpu_samples=None, with_machine=False):
     now, conn = time.time(), connect()
     if now - _cache["history_synced_at"] > 30:
         sync_history(conn)
         _cache["history_synced_at"] = now
 
-    procs, children = process_table()
+    procs, children = process_table(cpu_samples)
     tasks = flow_tasks()
     waiting = dict(conn.execute("select id, reason from waiting"))
     live = []
@@ -504,14 +779,17 @@ def build_snapshot():
             }
         )
     live.sort(key=lambda s: (STATE_ORDER[s["state"]], -s["last_active"]))
-    return {"now": now, "live": live}
+    board = {"now": now, "live": live}
+    if with_machine:
+        board["machine"] = machine_report(procs, children, live, now)
+    return board
 
 
 def snapshot():
     """The current board, rebuilt at most every 2 seconds however many tabs poll it."""
     with _cache_lock:
         if time.time() - _cache["at"] >= 2:
-            _cache["data"] = build_snapshot()
+            _cache["data"] = build_snapshot(_cpu_samples, with_machine=True)
             _cache["at"] = time.time()
         return _cache["data"]
 
@@ -652,6 +930,42 @@ def _select_tab(app, tty):
 # ---------------------------------------------------------------- web server
 
 
+def peer_uid(client_port, server_port):
+    """The uid that owns the client end of a local TCP connection, or None if we can't tell."""
+    if sys.platform.startswith("linux"):
+        # /proc/net/tcp lists every socket with its owner; ports are hex.
+        wanted = (f":{client_port:04X}", f":{server_port:04X}")
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(table, encoding="ascii") as f:
+                    for line in list(f)[1:]:
+                        fields = line.split()
+                        if fields[1].endswith(wanted[0]) and fields[2].endswith(wanted[1]):
+                            return int(fields[7])
+            except (OSError, IndexError, ValueError):
+                continue
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP@127.0.0.1:{client_port}", "-sTCP:ESTABLISHED", "-Fpu"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # lsof prints "p<pid>" then "u<uid>" for every process with that socket open,
+    # including this server (whose remote end is the client port). Skip ourselves.
+    pid = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("u") and pid != os.getpid():
+            return int(line[1:])
+    return None
+
+
+
 class Handler(BaseHTTPRequestHandler):
     allowed_hosts = (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
 
@@ -664,13 +978,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _trusted(self):
-        # The board shows your prompts. Refusing other Host headers stops a web page
-        # from reading it through DNS rebinding; refusing other Origins stops
-        # cross-site POSTs to the focus endpoint.
+        # The board shows your prompts and can kill processes. Refusing other Host
+        # headers stops a web page from reading it through DNS rebinding; refusing
+        # other Origins stops cross-site POSTs to the focus and kill endpoints.
         origin = self.headers.get("Origin")
         return self.headers.get("Host") in self.allowed_hosts and (
             origin is None or origin in (f"http://{h}" for h in self.allowed_hosts)
         )
+
+    def _from_this_user(self):
+        # Any account on this machine can reach 127.0.0.1. The board shows your
+        # prompts and can kill your processes, so only serve connections that come
+        # from one of your own processes.
+        uid = peer_uid(self.client_address[1], PORT)
+        return uid is not None and uid == os.getuid()
 
     def do_GET(self):
         self._route("GET")
@@ -681,6 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self, method):
         if not self._trusted():
             return self._send(403, "forbidden")
+        if not self._from_this_user():
+            return self._send(403, "Only the user running the board can open it.")
         url = urlparse(self.path)
         query = parse_qs(url.query)
         if method == "GET" and url.path == "/":
@@ -692,6 +1015,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(search_history(query.get("q", [""])[0])), "application/json")
         elif method == "POST" and url.path == "/api/focus":
             self._send(200, focus(query.get("sid", [""])[0]))
+        elif method == "POST" and url.path == "/api/kill":
+            try:
+                pid, started = int(query["pid"][0]), float(query["started"][0])
+            except (KeyError, ValueError):
+                return self._send(400, "pid and started are required")
+            ok, message = kill_tree(pid, started, force=query.get("force") == ["1"])
+            self._send(200 if ok else 409, message)
         else:
             self._send(404, "not found")
 
@@ -708,6 +1038,7 @@ def serve():
     conn.execute("delete from subagents where started < ?", (now - 14 * 86400,))
     conn.execute("delete from waiting where since < ?", (now - 3 * 86400,))
     conn.commit()
+    threading.Thread(target=sample_forever, daemon=True).start()
     print(f"claude-session-board on http://127.0.0.1:{PORT}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 

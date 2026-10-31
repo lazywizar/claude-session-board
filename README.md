@@ -5,10 +5,15 @@ working on, which ones are blocked waiting for you, their subagents and processe
 back to them.
 
 Built for the "twenty terminal tabs, one of them has been asking me a question for an hour"
-problem.
+problem, and its cousin: "the fan has been loud all afternoon and I don't know which of those
+tabs left a build running."
+
+![The board with the Machine CPU panel open](docs/machine-cpu.png)
 
 - Sessions grouped by what needs you, with a desktop notification when one gets blocked.
-- Click a row for its prompts, subagents, child processes and CPU, edited files and PR.
+- Click a row for its prompts, subagents, edited files, PR, and the processes it started.
+- A **Machine CPU** panel: what is actually using your CPU, which session it belongs to, dev
+  servers and builds left running after their session closed, and a **Kill** button for each.
 - **Jump to terminal** for iTerm2 and Terminal, or the editor window for VS Code, Cursor and Windsurf.
 - Searchable history of past sessions, each with its resume command.
 - `board.py who` tells an agent which other sessions are working in the same repo.
@@ -68,8 +73,33 @@ Optional:
 Cursor terminal tabs too, set `"terminal.integrated.tabs.title": "${process}${separator}${sequence}"`
 and don't rename tabs by hand (a manual tab name hides the one Claude sets).
 
+![A working session, expanded](docs/session.png)
+
 **Close sessions freely.** Claude saves the conversation as it goes. Close the tab or press
 `Ctrl+D`, and the session moves to History with a resume command (`claude --resume <id>`).
+
+**Machine CPU** sits above the sessions; click it to open. It lists:
+
+- **Running hot**: anything above 80% of a core for 2 minutes. The panel turns red and you get
+  one desktop notification per process.
+- **Busiest processes right now**, each labeled with its owner: a session by name, a leftover,
+  an app, or the system. 100% means one full core, so a parallel build can show several hundred.
+- **Leftovers**: dev tools (node, python, test runners, bundlers, headless browsers...) whose
+  parent is gone. When a terminal tab or session closes, what it started keeps running under
+  pid 1. Each leftover shows its whole process tree, the folder it runs in, and the live session
+  in that folder if there is one.
+- **Zombies**: processes that already exited but haven't been collected by their parent. They
+  use no CPU and can't be killed; they go away when the parent exits.
+
+**Kill** appears on processes your sessions started and on leftovers, never on apps or the
+system. It asks for a second click, then pauses the whole process tree, sends SIGTERM to all
+of it, and lets it continue, so a watcher can't restart a child mid-kill. If it is still
+listed a few seconds later, the button becomes **Force kill** (SIGKILL). Only the user running
+the board can open it at all.
+
+The server samples every 15 seconds even with no page open, so hot alerts still reach you.
+CPU is measured from each process's CPU time between two samples, not taken from `ps`'s
+%cpu, which on macOS is a slow decaying average that hides spikes.
 
 **For agents**, run `python3 ~/.claude-session-board/board.py who` from a repo:
 
@@ -101,7 +131,8 @@ The board reads, never writes, Claude Code's own files:
 | `~/.claude/projects/*/<session>.jsonl` | Title, first and last prompt, PR link, last reply |
 | `~/.claude/projects/*/<session>/subagents/*.meta.json` | Subagent descriptions |
 | `~/.claude/jobs/<id>/state.json` | What a blocked background job needs |
-| `ps` | Child processes and CPU |
+| `ps` | Processes, their parents, CPU time and age |
+| `lsof` | The folder a leftover process is running in |
 
 The hook (`board.py hook`, run asynchronously so it never slows a session down) records what
 those can't: when a dialog opens and closes, when subagents start and stop, and which files were
@@ -109,8 +140,10 @@ edited. It stores that, plus an index of past sessions, in `board.db`.
 
 ## Privacy
 
-The board adds no network traffic: it only reads local files and sends nothing anywhere. The server listens on `127.0.0.1` only and rejects requests whose
-`Host` or `Origin` isn't localhost, so web pages can't read your prompts. `board.db` holds short
+The board adds no network traffic: it only reads local files and sends nothing anywhere. The
+server listens on `127.0.0.1` only and rejects requests whose `Host` or `Origin` isn't
+localhost, so other web pages can't read your prompts or press Kill. It also checks which
+account opened each connection, so other users on a shared machine are turned away. `board.db` holds short
 excerpts of your prompts; delete it any time.
 
 ## Uninstall

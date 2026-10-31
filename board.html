@@ -72,6 +72,24 @@
     }
     button:hover { border-color: var(--mute); }
 
+    .machine { margin: 10px 0; padding: 8px 12px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+    .machine.alarm { border-color: var(--red); box-shadow: 0 0 0 2px rgba(212, 44, 32, .25); }
+    .machine summary { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; cursor: pointer; }
+    .machine h3 { margin: 12px 0 2px; font-size: 12px; font-weight: 600; color: var(--mute); }
+    .meter { flex: 0 0 160px; height: 8px; overflow: hidden; background: var(--chip); border-radius: 4px; }
+    .meter span { display: block; height: 100%; background: var(--green); }
+    .meter.busy span { background: var(--amber); }
+    .meter.full span { background: var(--red); }
+    .alert { margin: 8px 0 0; font-weight: 600; color: var(--red); }
+    .procs { width: 100%; margin: 4px 0; border-collapse: collapse; font-size: 12px; }
+    .procs td { padding: 3px 6px; vertical-align: top; border-top: 1px solid var(--line); }
+    .procs .num { text-align: right; white-space: nowrap; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .procs .command { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+    .cpu-high { font-weight: 700; color: var(--red); }
+    .cpu-mid { font-weight: 600; color: var(--amber); }
+    button.kill { color: var(--red); }
+    button.kill.armed { color: #fff; background: var(--red); border-color: var(--red); }
+
     #toast {
       position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: none;
       padding: 6px 14px; font-size: 13px; color: var(--bg); background: var(--fg); border-radius: 6px;
@@ -79,6 +97,7 @@
     @media (max-width: 640px) {
       .head { grid-template-columns: 1fr auto; }
       .topic { grid-column: 1 / 3; }
+      .procs .optional { display: none; }
     }
   </style>
 </head>
@@ -89,6 +108,7 @@
     <input id="filter" placeholder="Filter by repo, title, prompt, task..." autocomplete="off">
   </header>
   <main>
+    <div id="machine"></div>
     <div id="live"><div class="empty">Loading...</div></div>
     <h2><button id="history-toggle">Show history</button> <span id="history-info" class="mute"></span></h2>
     <div id="history"></div>
@@ -111,6 +131,8 @@
     let historyOpen = false;
     let historyTimer;
     let historyRequest = 0;
+    let machineOpen = false;
+    const signalled = new Set(); // pids already sent SIGTERM: their next click is a force kill
 
     function escapeHtml(value) {
       const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -179,10 +201,7 @@
           `<li>${a.running ? '<span class="running">running</span> ' : ""}${escapeHtml(a.desc || "(no description)")}
            <span class="mute small">${escapeHtml(a.type)} · ${timeAgo(a.last)}</span></li>`).join("") + "</ul>");
       }
-      if (s.procs.length) {
-        html += section("Child processes", "<ul>" + s.procs.map((p) =>
-          `<li><code>${p.cpu.toFixed(1)}%</code> <code>${escapeHtml(p.cmd)}</code></li>`).join("") + "</ul>");
-      }
+      if (s.procs.length) html += section("Processes it started, busiest first", processTable(s.procs));
       if (s.files.length) {
         html += section("Recently edited", "<ul>" + s.files.map((f) => `<li><code>${escapeHtml(f)}</code></li>`).join("") + "</ul>");
       }
@@ -200,7 +219,7 @@
           <div class="head" role="button" tabindex="0" aria-expanded="${expanded.has(s.sid)}">
             <span class="state">${LABELS[s.state]}</span>
             <span><span class="name">${escapeHtml(s.name)}</span> ${chips(s)}</span>
-            <span class="mute small">${s.cpu}% cpu · ${s.mb} MB · ${timeAgo(s.last_active)}</span>
+            <span class="mute small"><span class="${cpuClass(s.cpu)}">${Math.round(s.cpu)}% cpu</span> · ${s.mb} MB · ${timeAgo(s.last_active)}</span>
             ${showReason ? `<div class="reason">${escapeHtml(s.reason)}</div>` : ""}
             <span></span><span class="topic">${escapeHtml(s.title || s.first_prompt)}</span>
           </div>
@@ -224,8 +243,66 @@
         </div>`;
     }
 
+    function cpuClass(cpu) {
+      return cpu >= 80 ? "cpu-high" : cpu >= 25 ? "cpu-mid" : "";
+    }
+
+    function duration(seconds) {
+      if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))}m`;
+      if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+      return `${Math.round(seconds / 86400)}d`;
+    }
+
+    function killButton(p) {
+      if (!p.killable) return "";
+      const force = signalled.has(String(p.pid));
+      return `<button class="kill" data-kill="${p.pid}" data-started="${p.started}" ${force ? 'data-force="1"' : ""}>${force ? "Force kill" : "Kill"}</button>`;
+    }
+
+    // One row per process. `label` says who owns it; leftovers also say where they were started.
+    function processTable(procs, showLabel = false) {
+      const rows = procs.map((p) => `
+        <tr>
+          <td class="num ${cpuClass(p.cpu)}">${Math.round(p.cpu)}%</td>
+          ${showLabel ? `<td>${escapeHtml(p.label)}</td>` : ""}
+          <td class="num optional" title="running for">${duration(Date.now() / 1000 - p.started)}</td>
+          <td class="num optional">${p.mb} MB${p.count > 1 ? ` · ${p.count} procs` : ""}</td>
+          <td class="command">${escapeHtml(p.cmd)}${p.cwd ? `<div class="mute">in ${escapeHtml(p.cwd)}</div>` : ""}</td>
+          <td class="num">${killButton(p)} <span class="mute">pid ${p.pid}</span></td>
+        </tr>`);
+      return `<table class="procs">${rows.join("")}</table>`;
+    }
+
+    function renderMachine() {
+      const m = board.machine;
+      const used = Math.min(100, Math.round((100 * m.load) / m.cores));
+      const level = used >= 90 ? "full" : used >= 60 ? "busy" : "";
+      const sessionCpu = board.live.reduce((sum, s) => sum + s.cpu, 0);
+      let html = `
+        <summary>
+          <strong>Machine CPU</strong>
+          <span class="meter ${level}"><span style="width: ${used}%"></span></span>
+          <span>load ${m.load} on ${m.cores} cores</span>
+          <span class="mute small">Claude sessions ${Math.round(sessionCpu)}% · ${m.leftovers.length} leftover · ${m.zombies.length} zombie</span>
+          ${m.hot.length ? `<span class="count hot">${m.hot.length} running hot</span>` : ""}
+        </summary>`;
+      if (m.hot.length) {
+        html += '<div class="alert">Above 80% CPU for 2 minutes or more:</div>' + processTable(m.hot, true);
+      }
+      html += "<h3>Busiest processes right now (100% = one full core)</h3>" + processTable(m.top, true);
+      html += "<h3>Leftovers: dev tools still running after the terminal or session that started them closed</h3>";
+      html += m.leftovers.length ? processTable(m.leftovers, true) : '<div class="empty">None.</div>';
+      if (m.zombies.length) {
+        html += "<h3>Zombies: already exited and use no CPU. They disappear when their parent exits.</h3><ul>" +
+          m.zombies.map((z) => `<li><code>pid ${z.pid}</code>, parent <code>${z.parent}</code> <code>${escapeHtml(z.parent_cmd)}</code></li>`).join("") +
+          "</ul>";
+      }
+      $("machine").innerHTML = `<details class="machine ${m.hot.length ? "alarm" : ""}" ${machineOpen ? "open" : ""}>${html}</details>`;
+    }
+
     function renderLive() {
       if (!board) return;
+      renderMachine();
       const query = $("filter").value.trim();
       const live = board.live.filter((s) => matchesFilter(s, query));
       const count = (state) => board.live.filter((s) => s.state === state).length;
@@ -252,6 +329,7 @@
     async function loadLive() {
       try {
         board = await (await fetch("/api/sessions")).json();
+        forgetExitedProcesses();
         renderLive();
       } catch {
         $("counts").innerHTML = '<span class="count hot">board server not responding</span>';
@@ -296,7 +374,49 @@
       }
     });
 
+    // The panel is re-rendered every poll, so remember whether it was left open.
+    document.addEventListener("toggle", (event) => {
+      if (event.target.classList?.contains("machine")) machineOpen = event.target.open;
+    }, true);
+
+    // A pid that is no longer on the board has exited; if it comes back, it's a new process.
+    function forgetExitedProcesses() {
+      const listed = new Set();
+      const m = board.machine;
+      for (const p of [...m.top, ...m.hot, ...m.leftovers, ...board.live.flatMap((s) => s.procs)]) listed.add(String(p.pid));
+      for (const pid of signalled) if (!listed.has(pid)) signalled.delete(pid);
+    }
+
+    async function kill(button) {
+      // First click arms the button, a second click within 3 seconds sends the signal.
+      if (!button.classList.contains("armed")) {
+        const label = button.textContent;
+        button.classList.add("armed");
+        button.textContent = "Sure?";
+        button.disarm = setTimeout(() => {
+          button.classList.remove("armed");
+          button.textContent = label;
+        }, 3000);
+        return;
+      }
+      clearTimeout(button.disarm);
+      const { kill: pid, started, force } = button.dataset;
+      const params = new URLSearchParams({ pid, started });
+      if (force) params.set("force", "1");
+      try {
+        const response = await fetch("/api/kill?" + params, { method: "POST" });
+        toast(await response.text());
+        if (response.ok) signalled.add(pid);
+      } catch {
+        toast("board server not responding");
+      }
+      button.classList.remove("armed");
+      setTimeout(loadLive, 1500);
+    }
+
     document.addEventListener("click", async (event) => {
+      const killTarget = event.target.closest("[data-kill]");
+      if (killTarget) return kill(killTarget);
       const copyButton = event.target.closest("[data-copy]");
       const focusButton = event.target.closest("[data-focus]");
       if (copyButton) {
@@ -340,8 +460,9 @@
 
     loadLive();
     setInterval(() => {
-      // Skip a refresh while the tab is hidden or the user is selecting text to copy.
-      if (!document.hidden && !getSelection().toString()) loadLive();
+      // Skip a refresh while the tab is hidden, the user is selecting text to copy,
+      // or a Kill button is waiting for its second click.
+      if (!document.hidden && !getSelection().toString() && !document.querySelector(".armed")) loadLive();
     }, POLL_MS);
   </script>
 </body>
