@@ -93,6 +93,17 @@ class HookTests(TempHome):
         board.record_event(self.conn, self.event("PostToolUse", tool_name="Read", tool_use_id="t9"), 3)
         self.assertIn("s1", self.waiting())  # the wait is tied to t1 now, so t9 doesn't clear it
 
+    def test_one_banner_per_blocked_stretch(self):
+        board.record_event(self.conn, self.event("Notification", notification_type="permission_prompt", message="x"), 1)
+        # The PermissionRequest replaces the Notification's row during the delay...
+        board.record_event(self.conn, self.event("PermissionRequest", tool_name="Bash", tool_use_id="t1",
+                                                 tool_input={"command": "make"}), 2)
+        # ...and the timer still finds the session blocked, once.
+        self.assertEqual(board.claim_notification(self.conn, "s1"), "approve Bash: make")
+        self.assertIsNone(board.claim_notification(self.conn, "s1"))
+        board.record_event(self.conn, self.event("Stop"), 3)
+        self.assertIsNone(board.claim_notification(self.conn, "s1"))
+
     def test_stop_clears_any_prompt(self):
         board.record_event(self.conn, self.event("PreToolUse", tool_name="ExitPlanMode"), time.time())
         board.record_event(self.conn, self.event("Stop"), time.time())

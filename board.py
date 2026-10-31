@@ -58,7 +58,7 @@ def connect():
     conn.executescript(
         """
         create table if not exists waits (
-            id text, agent text, call text, reason text, since real,
+            id text, agent text, call text, reason text, since real, notified integer default 0,
             primary key (id, agent, call));
         create table if not exists subagents (
             id text, agent text, type text, started real, ended real,
@@ -183,7 +183,7 @@ def record_event(conn, event, now):
                 # The Notification arrived first: now we know which tool call it was for.
                 conn.execute("delete from waits where id = ? and agent = ? and call = ''", (session_id, agent))
             inserted = conn.execute(
-                "insert into waits values (?, ?, ?, ?, ?) on conflict do nothing",
+                "insert into waits (id, agent, call, reason, since) values (?, ?, ?, ?, ?) on conflict do nothing",
                 (session_id, agent, call, reason, now),
             ).rowcount
             return reason, bool(inserted) and not already_blocked
@@ -222,18 +222,34 @@ def run_hook():
         return
     now = time.time()
     conn = connect()
-    reason, newly_blocked = record_event(conn, event, now)
+    _, newly_blocked = record_event(conn, event, now)
     if not newly_blocked:
         return
     # Most permission prompts in auto mode resolve on their own. Only bother the
-    # user if this one is still open after a few seconds.
+    # user if the session is still blocked after a few seconds.
     time.sleep(NOTIFY_DELAY)
-    agent, call = wait_key(event)
-    row = conn.execute(
-        "select since from waits where id = ? and agent = ? and call = ?", (event["session_id"], agent, call)
-    ).fetchone()
-    if row and row[0] == now:  # still the same wait this hook started, not a newer one
+    reason = claim_notification(conn, event["session_id"])
+    if reason:
         notify(f"Claude needs you: {session_name(event['session_id'])}", reason)
+
+
+def claim_notification(conn, session_id):
+    """The reason to show if this session is still blocked and nobody has told the user yet.
+
+    Checks the session rather than the dialog that started the timer: that dialog may
+    have been replaced (a Notification upgraded to its PermissionRequest) or answered
+    while another one stays open. Marking the rows means one banner per blocked stretch,
+    however many timers were started.
+    """
+    with conn:
+        oldest = conn.execute(
+            "select reason from waits where id = ? and not exists (select 1 from waits where id = ? and notified)"
+            " order by since limit 1",
+            (session_id, session_id),
+        ).fetchone()
+        if oldest:
+            conn.execute("update waits set notified = 1 where id = ?", (session_id,))
+    return oldest[0] if oldest else None
 
 
 # ---------------------------------------------------------------- reading Claude Code's files
