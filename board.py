@@ -797,8 +797,17 @@ def sync_history(conn):
             continue
         t = read_transcript(path)
         if t.get("first_prompt") or t.get("title"):
+            # Titles and PR links are only read from the transcript's tail, so a long
+            # session can grow past them. Keep what we found before rather than blank it.
             conn.execute(
-                "insert or replace into history values (?, ?, ?, ?, ?, ?, ?)",
+                """insert into history values (?, ?, ?, ?, ?, ?, ?)
+                on conflict (id) do update set
+                    cwd = coalesce(nullif(excluded.cwd, ''), cwd),
+                    title = coalesce(nullif(excluded.title, ''), title),
+                    first_prompt = coalesce(nullif(excluded.first_prompt, ''), first_prompt),
+                    last_prompt = coalesce(nullif(excluded.last_prompt, ''), last_prompt),
+                    pr = coalesce(nullif(excluded.pr, ''), pr),
+                    mtime = excluded.mtime""",
                 (session_id, t["cwd"], t["title"], t["first_prompt"], t["last_prompt"], t["pr"], t["mtime"]),
             )
     conn.commit()
@@ -832,6 +841,7 @@ def build_snapshot(cpu_samples=None, with_machine=False):
     tasks = flow_tasks()
     # Oldest open dialog per session: dict() keeps the last row for each id.
     waiting = dict(conn.execute("select id, reason from waits order by since desc"))
+    remembered = {row[0]: row[1:] for row in conn.execute("select id, title, pr from history")}
     live = []
     for agent in live_sessions():
         session_id = agent.get("sessionId")
@@ -857,10 +867,10 @@ def build_snapshot(cpu_samples=None, with_machine=False):
                 "reason": reason,
                 "pid": agent.get("pid"),
                 **process_stats(agent.get("pid"), procs, children),
-                "title": t.get("title", ""),
+                "title": t.get("title") or remembered.get(session_id, ("", ""))[0] or "",
                 "first_prompt": t.get("first_prompt", ""),
                 "last_prompt": t.get("last_prompt", ""),
-                "pr": t.get("pr", ""),
+                "pr": t.get("pr") or remembered.get(session_id, ("", ""))[1] or "",
                 "flow": tasks.get(session_id),
                 "last_active": t.get("mtime") or (agent.get("startedAt") or 0) / 1000,
                 "subagents": subagents_of(session_id, transcript, conn, now),

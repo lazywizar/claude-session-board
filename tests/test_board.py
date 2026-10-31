@@ -167,6 +167,25 @@ class TranscriptTests(TempHome):
         self.assertEqual(info["cwd"], "/repo")
         self.assertEqual(board.session_state("abc", "idle", info, {})[0], "asked")
 
+    def test_title_and_pr_survive_a_long_session(self):
+        path = os.path.join(board.PROJECTS_DIR, "-code-app", "s9.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        records = [
+            {"type": "user", "cwd": "/code/app", "message": {"content": "Fix login"}},
+            {"type": "custom-title", "customTitle": "login fix"},
+            {"type": "pr-link", "prUrl": "https://example.com/pr/1"},
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in records)
+        board.sync_history(self.conn)
+        filler = {"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 1000}]}}
+        with open(path, "a", encoding="utf-8") as f:
+            f.writelines(json.dumps(filler) + "\n" for _ in range(700))  # pushes the title out of the tail
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        board.sync_history(self.conn)
+        title, pr = self.conn.execute("select title, pr from history where id = 's9'").fetchone()
+        self.assertEqual((title, pr), ("login fix", "https://example.com/pr/1"))
+
     def test_history_search(self):
         self.write_transcript([
             {"type": "user", "cwd": "/repo", "message": {"content": "Add dark mode"}},
