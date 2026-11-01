@@ -301,7 +301,9 @@
       if (m.hot.length) {
         html += '<div class="alert">Above 80% CPU for 2 minutes or more:</div>' + processTable(m.hot, true);
       }
-      html += "<h3>Busiest processes right now (100% = one full core)</h3>" + processTable(m.top, true);
+      // A hot process is usually also among the busiest: list it once, under the alert.
+      const hot = new Set(m.hot.map((p) => p.pid));
+      html += "<h3>Busiest processes right now (100% = one full core)</h3>" + processTable(m.top.filter((p) => !hot.has(p.pid)), true);
       html += "<h3>Leftovers: dev tools still running after the terminal or session that started them closed</h3>";
       html += m.leftovers.length ? processTable(m.leftovers, true) : '<div class="empty">None.</div>';
       if (m.zombies.length) {
